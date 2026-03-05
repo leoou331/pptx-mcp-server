@@ -1,0 +1,5 @@
+# PPTX MCP Server
+
+python-pptx==0.6.23
+lxml>=4.9.0
+Pillow>=10.0.0
