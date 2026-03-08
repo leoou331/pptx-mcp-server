@@ -7,14 +7,18 @@ PPTX 工具管理器
 import os
 import re
 import logging
+import tempfile
+import warnings
+from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
+from PIL import Image, UnidentifiedImageError
 from pptx import Presentation
 from pptx.util import Inches, Pt, Emu
 from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
 from pptx.oxml.ns import qn
 
-from security.validator import validate_pptx, safe_path, limits
+from security.validator import validate_pptx, safe_path_in_dirs, limits
 from security.session import SessionManager
 from security.tempfile import temp_manager
 
@@ -26,6 +30,10 @@ EMU_PER_INCH = 914400
 
 class PptxTools:
     """PPTX 工具集合（线程安全）"""
+
+    MAX_NAME_LENGTH = 255
+    MAX_SLIDE_COORDINATE_INCHES = 100.0
+    MAX_FONT_SIZE = 400
     
     def __init__(self, session_manager: SessionManager, work_dir: str):
         self.sessions = session_manager
@@ -60,6 +68,87 @@ class PptxTools:
                 f"slide_index {slide_index} 超出范围 (有效范围: 0-{total - 1})"
             )
         return slide_index
+
+    def _resolve_path(self, user_path: str) -> str:
+        """将用户路径限制在工作目录或服务临时目录内。"""
+        return safe_path_in_dirs(self.work_dir, user_path, temp_manager.temp_dir)
+
+    def _validate_name(self, name: str) -> str:
+        if not isinstance(name, str):
+            raise TypeError("name 必须是字符串")
+
+        cleaned = name.strip()
+        if not cleaned:
+            raise ValueError("name 不能为空")
+        if len(cleaned) > self.MAX_NAME_LENGTH:
+            raise ValueError(f"name 过长: {len(cleaned)} > {self.MAX_NAME_LENGTH}")
+        return cleaned
+
+    def _validate_non_negative(self, value: Any, field_name: str) -> float:
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise TypeError(f"{field_name} 必须是数字")
+
+        numeric = float(value)
+        if numeric < 0:
+            raise ValueError(f"{field_name} 不能为负数")
+        if numeric > self.MAX_SLIDE_COORDINATE_INCHES:
+            raise ValueError(
+                f"{field_name} 超出允许范围: {numeric} > {self.MAX_SLIDE_COORDINATE_INCHES}"
+            )
+        return numeric
+
+    def _validate_positive(self, value: Any, field_name: str) -> float:
+        numeric = self._validate_non_negative(value, field_name)
+        if numeric <= 0:
+            raise ValueError(f"{field_name} 必须大于 0")
+        return numeric
+
+    def _validate_int(self, value: Any, field_name: str, *, minimum: int = 0) -> int:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"{field_name} 必须是整数")
+        if value < minimum:
+            raise ValueError(f"{field_name} 不能小于 {minimum}")
+        return value
+
+    def _save_presentation_atomically(self, presentation: Presentation, output_path: str) -> None:
+        """通过同目录临时文件 + 原子替换避免目标文件损坏。"""
+        target = Path(output_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        temp_fd, temp_name = tempfile.mkstemp(
+            prefix=f".{target.stem}.",
+            suffix=target.suffix or ".pptx",
+            dir=str(target.parent),
+        )
+        os.close(temp_fd)
+
+        try:
+            presentation.save(temp_name)
+            os.replace(temp_name, target)
+        except Exception:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
+            raise
+
+    def _validate_image_file(self, image_path: str) -> None:
+        """预先验证图片，避免将异常直接抛给 python-pptx/Pillow 内部栈。"""
+        image_size = os.path.getsize(image_path)
+        if image_size > limits.MAX_IMAGE_SIZE:
+            raise ValueError(
+                f"图片过大: {image_size/1024/1024:.1f}MB > {limits.MAX_IMAGE_SIZE/1024/1024}MB"
+            )
+
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                with Image.open(image_path) as image:
+                    image.verify()
+        except Image.DecompressionBombWarning as exc:
+            raise ValueError(f"图片像素过大，疑似资源炸弹: {image_path}") from exc
+        except (UnidentifiedImageError, OSError, ValueError) as exc:
+            raise ValueError(f"无效图片文件: {image_path}") from exc
     
     def create(self, name: str = "Untitled") -> Dict[str, Any]:
         """
@@ -71,11 +160,12 @@ class PptxTools:
         Returns:
             会话信息
         """
-        session_id = self.sessions.create(name)
+        cleaned_name = self._validate_name(name)
+        session_id = self.sessions.create(cleaned_name)
         
         return {
             "session_id": session_id,
-            "name": name,
+            "name": cleaned_name,
             "slide_count": 0,
             "message": "演示文稿已创建"
         }
@@ -90,9 +180,9 @@ class PptxTools:
         Returns:
             会话信息
         """
-        # 路径安全检查
-        if not os.path.isabs(file_path):
-            file_path = safe_path(self.work_dir, file_path)
+        file_path = self._resolve_path(file_path)
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"文件不存在: {file_path}")
         
         session_id = self.sessions.open(file_path)
         session = self.sessions.get(session_id)
@@ -120,13 +210,13 @@ class PptxTools:
         session = self.sessions.get(session_id)
         
         if output_path:
-            output_path = safe_path(self.work_dir, output_path)
+            output_path = self._resolve_path(output_path)
         else:
             output_path = temp_manager.create(suffix='.pptx')
         
         with session.lock:  # 使用 Session 级别的锁
             prs = session.presentation
-            prs.save(output_path)
+            self._save_presentation_atomically(prs, output_path)
             session.dirty = False
             
             return {
@@ -203,6 +293,7 @@ class PptxTools:
             添加结果
         """
         session = self.sessions.get(session_id)
+        layout_index = self._validate_int(layout_index, "layout_index")
         
         with session.lock:  # 使用 Session 级别的锁
             prs = session.presentation
@@ -213,7 +304,7 @@ class PptxTools:
             
             # 验证布局索引
             if layout_index >= len(prs.slide_layouts):
-                layout_index = 0
+                raise ValueError(f"布局索引越界: {layout_index}")
             
             slide = prs.slides.add_slide(prs.slide_layouts[layout_index])
             session.dirty = True
@@ -252,10 +343,23 @@ class PptxTools:
             添加结果
         """
         session = self.sessions.get(session_id)
+        slide_index = self._validate_int(slide_index, "slide_index")
         
         # 文本长度检查
+        if not isinstance(text, str):
+            raise TypeError("text 必须是字符串")
         if len(text) > limits.MAX_TEXT_LENGTH:
             raise ValueError(f"文本过长: {len(text)} > {limits.MAX_TEXT_LENGTH}")
+        if position not in {"title", "body", "custom"}:
+            raise ValueError(f"无效 position: {position}")
+
+        left = self._validate_non_negative(left, "left")
+        top = self._validate_non_negative(top, "top")
+        width = self._validate_positive(width, "width")
+        height = self._validate_positive(height, "height")
+        font_size = self._validate_int(font_size, "font_size", minimum=1)
+        if font_size > self.MAX_FONT_SIZE:
+            raise ValueError(f"font_size 过大: {font_size} > {self.MAX_FONT_SIZE}")
         
         with session.lock:  # 使用 Session 级别的锁
             prs = session.presentation
@@ -319,19 +423,22 @@ class PptxTools:
             添加结果
         """
         session = self.sessions.get(session_id)
+        slide_index = self._validate_int(slide_index, "slide_index")
+        left = self._validate_non_negative(left, "left")
+        top = self._validate_non_negative(top, "top")
+        if width is not None:
+            width = self._validate_positive(width, "width")
+        if height is not None:
+            height = self._validate_positive(height, "height")
         
-        # 路径安全检查
-        if not os.path.isabs(image_path):
-            image_path = safe_path(self.work_dir, image_path)
+        image_path = self._resolve_path(image_path)
         
         # 检查文件存在
-        if not os.path.exists(image_path):
+        if not os.path.isfile(image_path):
             raise FileNotFoundError(f"图片不存在: {image_path}")
         
-        # 检查图片大小
+        self._validate_image_file(image_path)
         image_size = os.path.getsize(image_path)
-        if image_size > limits.MAX_IMAGE_SIZE:
-            raise ValueError(f"图片过大: {image_size/1024/1024:.1f}MB > {limits.MAX_IMAGE_SIZE/1024/1024}MB")
         
         with session.lock:  # 使用 Session 级别的锁
             prs = session.presentation
@@ -357,6 +464,13 @@ class PptxTools:
                     Inches(left),
                     Inches(top),
                     width=Inches(width)
+                )
+            elif height:
+                slide.shapes.add_picture(
+                    image_path,
+                    Inches(left),
+                    Inches(top),
+                    height=Inches(height)
                 )
             else:
                 slide.shapes.add_picture(
@@ -400,6 +514,22 @@ class PptxTools:
             添加结果
         """
         session = self.sessions.get(session_id)
+        slide_index = self._validate_int(slide_index, "slide_index")
+        rows = self._validate_int(rows, "rows", minimum=1)
+        cols = self._validate_int(cols, "cols", minimum=1)
+        left = self._validate_non_negative(left, "left")
+        top = self._validate_non_negative(top, "top")
+        width = self._validate_positive(width, "width")
+        height = self._validate_positive(height, "height")
+
+        if rows > limits.MAX_TABLE_ROWS:
+            raise ValueError(f"rows 过大: {rows} > {limits.MAX_TABLE_ROWS}")
+        if cols > limits.MAX_TABLE_COLS:
+            raise ValueError(f"cols 过大: {cols} > {limits.MAX_TABLE_COLS}")
+        if rows * cols > limits.MAX_TABLE_CELLS:
+            raise ValueError(f"表格单元格过多: {rows * cols} > {limits.MAX_TABLE_CELLS}")
+        if data is not None and not isinstance(data, list):
+            raise TypeError("data 必须是二维数组")
         
         with session.lock:  # 使用 Session 级别的锁
             prs = session.presentation
@@ -422,6 +552,10 @@ class PptxTools:
             # 填充数据
             if data:
                 for i, row_data in enumerate(data[:rows]):
+                    if row_data is None:
+                        continue
+                    if not isinstance(row_data, list):
+                        raise TypeError("data 的每一行都必须是数组")
                     for j, cell_data in enumerate(row_data[:cols]):
                         if cell_data is not None:
                             table.cell(i, j).text = str(cell_data)
@@ -522,9 +656,9 @@ class PptxTools:
         Returns:
             验证结果
         """
-        # 路径安全检查
-        if not os.path.isabs(file_path):
-            file_path = safe_path(self.work_dir, file_path)
+        file_path = self._resolve_path(file_path)
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"文件不存在: {file_path}")
         
         valid, message = validate_pptx(file_path)
         
@@ -1114,4 +1248,3 @@ class PptxTools:
                 "transition_info": ti, "animation_count": len(anims),
                 "animations": anims, "animated_shape_indices": sorted(anis),
             }
-

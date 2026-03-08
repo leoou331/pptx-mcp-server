@@ -12,6 +12,7 @@ PPTX MCP Server v3.0
   python server.py --port 8010 --token your-token
 """
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -20,7 +21,7 @@ import sys
 import argparse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
-from typing import Optional, Dict, Any
+from typing import Optional
 
 # ===== 安全配置：必须在导入 pptx 之前 =====
 from lxml import etree
@@ -41,14 +42,8 @@ def _secure_XMLParser(*args, **kwargs):
 etree.XMLParser = _secure_XMLParser
 lxml_etree.XMLParser = _secure_XMLParser
 
-# ===== 导入 pptx =====
-from pptx import Presentation
-
 # ===== 导入安全模块 =====
 from security import (
-    validate_pptx,
-    has_macro,
-    safe_path,
     limits,
     SessionManager,
     temp_manager
@@ -61,6 +56,10 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 log = logging.getLogger("pptx-server")
+
+SERVER_VERSION = "3.0.1"
+SUPPORTED_PROTOCOL_VERSION = "2024-11-05"
+MAX_REQUEST_SIZE = 1024 * 1024  # 1MB
 
 # ===== MCP 工具定义 =====
 TOOLS = [
@@ -313,9 +312,29 @@ class McpHandler(BaseHTTPRequestHandler):
     
     def log_message(self, format, *args):
         log.info(format % args)
+
+    def _is_authorized(self) -> bool:
+        """校验 Bearer Token。"""
+        if not self.token:
+            return True
+
+        auth = self.headers.get("Authorization", "")
+        expected = f"Bearer {self.token}"
+        return hmac.compare_digest(auth, expected)
+
+    def _send_accepted(self):
+        """通知类请求的空响应。"""
+        self.send_response(202)
+        self.send_header("Content-Length", "0")
+        self.send_header("MCP-Protocol-Version", SUPPORTED_PROTOCOL_VERSION)
+        self.end_headers()
     
     def do_GET(self):
         """处理 GET 请求"""
+        if self.path != "/health" and not self._is_authorized():
+            self.send_error(401, "Unauthorized")
+            return
+
         if self.path == "/health":
             self._handle_health()
         elif self.path == "/tools/list":
@@ -332,72 +351,156 @@ class McpHandler(BaseHTTPRequestHandler):
             return
         
         # 认证检查
-        if self.token:
-            auth = self.headers.get("Authorization", "")
-            if auth != f"Bearer {self.token}":
-                self.send_error(401, "Unauthorized")
-                return
+        if not self._is_authorized():
+            self.send_error(401, "Unauthorized")
+            return
+
+        protocol_header = self.headers.get("MCP-Protocol-Version")
+        if protocol_header and protocol_header != SUPPORTED_PROTOCOL_VERSION:
+            self.send_error(400, "Unsupported MCP-Protocol-Version")
+            return
         
         # 解析请求
-        content_length = int(self.headers.get("Content-Length", 0))
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.send_error(400, "Invalid Content-Length")
+            return
+
+        if content_length < 0:
+            self.send_error(400, "Invalid Content-Length")
+            return
         if content_length == 0:
             self.send_error(400, "Empty request")
             return
+        if content_length > MAX_REQUEST_SIZE:
+            self.send_error(413, "Request too large")
+            return
         
-        body = self.rfile.read(content_length).decode("utf-8")
+        raw_body = self.rfile.read(content_length)
+        try:
+            body = raw_body.decode("utf-8")
+        except UnicodeDecodeError:
+            self.send_error(400, "Request must be UTF-8 JSON")
+            return
         
         try:
             request = json.loads(body)
         except json.JSONDecodeError:
             self.send_error(400, "Invalid JSON")
             return
+
+        if not isinstance(request, dict):
+            self._send_json(None, error={
+                "code": -32600,
+                "message": "Invalid Request"
+            })
+            return
+
+        if request.get("jsonrpc") != "2.0":
+            self._send_json(request.get("id"), error={
+                "code": -32600,
+                "message": "Invalid Request"
+            })
+            return
         
         method = request.get("method", "")
         req_id = request.get("id")
+        is_notification = "id" not in request
         
         try:
-            if method == "initialize":
-                result = {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {
-                        "name": "pptx-server",
-                        "version": "3.0.0"
-                    }
-                }
-                self._send_json(req_id, result=result)
-            elif method == "tools/list":
-                self._send_json(req_id, result={"tools": TOOLS})
-            elif method == "tools/call":
-                result = self._handle_tool_call(request.get("params", {}))
-                self._send_json(req_id, result=result)
-            else:
-                self._send_json(req_id, error={
-                    "code": -32601,
-                    "message": f"Unknown method: {method}"
-                })
+            response = self._dispatch_request(method, request.get("params"), is_notification)
         except ValidationError as e:
-            self._send_json(req_id, error={
+            if is_notification:
+                self.send_error(400, f"Validation failed: {str(e)}")
+                return
+            response = {"error": {
                 "code": -32001,
                 "message": f"验证失败: {str(e)}"
-            })
+            }}
         except SecurityError as e:
             log.warning(f"Security violation: {e}")
-            self._send_json(req_id, error={
+            if is_notification:
+                self.send_error(403, "Security validation failed")
+                return
+            response = {"error": {
                 "code": -32002,
                 "message": f"安全检查失败"
-            })
+            }}
         except SessionError as e:
-            self._send_json(req_id, error={
+            if is_notification:
+                self.send_error(400, f"Session error: {str(e)}")
+                return
+            response = {"error": {
                 "code": -32003,
                 "message": f"会话错误: {str(e)}"
-            })
+            }}
         except Exception as e:
-            log.error(f"Internal error: {e}")
-            self._send_json(req_id, error={
+            log.exception(f"Internal error: {e}")
+            if is_notification:
+                self.send_error(500, "Internal server error")
+                return
+            response = {"error": {
                 "code": -32603,
-                "message": f"内部错误: {str(e)}"
-            })
+                "message": "内部错误"
+            }}
+
+        if is_notification:
+            self._send_accepted()
+            return
+
+        self._send_json(req_id, result=response.get("result"), error=response.get("error"))
+
+    def _dispatch_request(self, method: str, params: Optional[dict], is_notification: bool) -> dict:
+        """分发 MCP 请求。"""
+        if not isinstance(method, str) or not method:
+            raise ValidationError("method 必须是非空字符串")
+
+        if method == "notifications/initialized":
+            return {}
+        if method == "notifications/cancelled":
+            return {}
+        if method == "ping":
+            return {"result": {}}
+        if method == "initialize":
+            return {"result": self._handle_initialize(params)}
+        if method == "tools/list":
+            return {"result": {"tools": TOOLS}}
+        if method == "tools/call":
+            return {"result": self._handle_tool_call(params)}
+        if is_notification and method.startswith("notifications/"):
+            return {}
+
+        return {"error": {
+            "code": -32601,
+            "message": f"Unknown method: {method}"
+        }}
+
+    def _handle_initialize(self, params: Optional[dict]) -> dict:
+        """处理 initialize 请求。"""
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            raise ValidationError("initialize params 必须是对象")
+
+        requested_version = params.get("protocolVersion")
+        if requested_version is not None and not isinstance(requested_version, str):
+            raise ValidationError("protocolVersion 必须是字符串")
+
+        return {
+            "protocolVersion": SUPPORTED_PROTOCOL_VERSION,
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {
+                "name": "pptx-server",
+                "version": SERVER_VERSION
+            }
+        }
+
+    def _require_arg(self, args: dict, name: str):
+        """读取必填参数。"""
+        if name not in args:
+            raise ValidationError(f"缺少参数: {name}")
+        return args[name]
     
     def _handle_health(self):
         """健康检查"""
@@ -421,7 +524,7 @@ class McpHandler(BaseHTTPRequestHandler):
         
         response = {
             "status": "healthy" if is_healthy else "degraded",
-            "version": "3.0.0",
+            "version": SERVER_VERSION,
             "checks": checks,
             "limits": {
                 "max_file_size_mb": limits.MAX_FILE_SIZE / 1024 / 1024,
@@ -445,8 +548,19 @@ class McpHandler(BaseHTTPRequestHandler):
     
     def _handle_tool_call(self, params: dict) -> dict:
         """处理工具调用"""
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            raise ValidationError("tools/call params 必须是对象")
+
         tool_name = params.get("name", "")
         args = params.get("arguments", {})
+        if not isinstance(tool_name, str) or not tool_name:
+            raise ValidationError("工具名称不能为空")
+        if args is None:
+            args = {}
+        if not isinstance(args, dict):
+            raise ValidationError("arguments 必须是对象")
         
         # 工具路由
         handlers = {
@@ -470,10 +584,17 @@ class McpHandler(BaseHTTPRequestHandler):
         }
         
         if tool_name not in handlers:
-            raise ValueError(f"未知工具: {tool_name}")
+            raise ValidationError(f"未知工具: {tool_name}")
         
         # 执行工具（在事件循环中）
-        result = handlers[tool_name](args)
+        try:
+            result = handlers[tool_name](args)
+        except FileNotFoundError as e:
+            raise ValidationError(str(e)) from e
+        except (TypeError, ValueError) as e:
+            raise ValidationError(str(e)) from e
+        except KeyError as e:
+            raise SessionError(str(e)) from e
         
         return {
             "content": [{
@@ -491,36 +612,36 @@ class McpHandler(BaseHTTPRequestHandler):
     
     def _tool_open(self, args: dict) -> dict:
         return self.tools.open(
-            file_path=args["file_path"]
+            file_path=self._require_arg(args, "file_path")
         )
     
     def _tool_save(self, args: dict) -> dict:
         return self.tools.save(
-            session_id=args["session_id"],
+            session_id=self._require_arg(args, "session_id"),
             output_path=args.get("output_path")
         )
     
     def _tool_close(self, args: dict) -> dict:
         return self.tools.close(
-            session_id=args["session_id"]
+            session_id=self._require_arg(args, "session_id")
         )
     
     def _tool_info(self, args: dict) -> dict:
         return self.tools.info(
-            session_id=args["session_id"]
+            session_id=self._require_arg(args, "session_id")
         )
     
     def _tool_add_slide(self, args: dict) -> dict:
         return self.tools.add_slide(
-            session_id=args["session_id"],
+            session_id=self._require_arg(args, "session_id"),
             layout_index=args.get("layout_index", 0)
         )
     
     def _tool_add_text(self, args: dict) -> dict:
         return self.tools.add_text(
-            session_id=args["session_id"],
-            slide_index=args["slide_index"],
-            text=args["text"],
+            session_id=self._require_arg(args, "session_id"),
+            slide_index=self._require_arg(args, "slide_index"),
+            text=self._require_arg(args, "text"),
             position=args.get("position", "body"),
             left=args.get("left", 1.0),
             top=args.get("top", 1.0),
@@ -531,21 +652,21 @@ class McpHandler(BaseHTTPRequestHandler):
     
     def _tool_add_image(self, args: dict) -> dict:
         return self.tools.add_image(
-            session_id=args["session_id"],
-            slide_index=args["slide_index"],
-            image_path=args["image_path"],
-            left=args["left"],
-            top=args["top"],
+            session_id=self._require_arg(args, "session_id"),
+            slide_index=self._require_arg(args, "slide_index"),
+            image_path=self._require_arg(args, "image_path"),
+            left=self._require_arg(args, "left"),
+            top=self._require_arg(args, "top"),
             width=args.get("width"),
             height=args.get("height")
         )
     
     def _tool_add_table(self, args: dict) -> dict:
         return self.tools.add_table(
-            session_id=args["session_id"],
-            slide_index=args["slide_index"],
-            rows=args["rows"],
-            cols=args["cols"],
+            session_id=self._require_arg(args, "session_id"),
+            slide_index=self._require_arg(args, "slide_index"),
+            rows=self._require_arg(args, "rows"),
+            cols=self._require_arg(args, "cols"),
             left=args.get("left", 1.0),
             top=args.get("top", 2.0),
             width=args.get("width", 8.0),
@@ -555,17 +676,17 @@ class McpHandler(BaseHTTPRequestHandler):
     
     def _tool_read_content(self, args: dict) -> dict:
         return self.tools.read_content(
-            session_id=args["session_id"]
+            session_id=self._require_arg(args, "session_id")
         )
     
     def _tool_list_slides(self, args: dict) -> dict:
         return self.tools.list_slides(
-            session_id=args["session_id"]
+            session_id=self._require_arg(args, "session_id")
         )
     
     def _tool_validate(self, args: dict) -> dict:
         return self.tools.validate(
-            file_path=args["file_path"]
+            file_path=self._require_arg(args, "file_path")
         )
 
     def _tool_list_images(self, args: dict) -> dict:
@@ -608,10 +729,14 @@ class McpHandler(BaseHTTPRequestHandler):
         
         body = json.dumps(response, ensure_ascii=False).encode("utf-8")
         self.send_response(200)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("MCP-Protocol-Version", SUPPORTED_PROTOCOL_VERSION)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except BrokenPipeError:
+            log.warning("Client disconnected before response was sent")
 
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
@@ -635,7 +760,7 @@ def main():
     # 设置类变量
     McpHandler.token = args.token if args.token else None
     
-    log.info(f"Starting PPTX MCP Server v3.0")
+    log.info(f"Starting PPTX MCP Server v{SERVER_VERSION}")
     log.info(f"Port: {args.port}")
     log.info(f"Work directory: {work_dir}")
     log.info(f"Max file size: {limits.MAX_FILE_SIZE / 1024 / 1024}MB")
