@@ -548,6 +548,18 @@ class SessionError(PptxError):
     pass
 
 
+def _check_json_depth(obj, current_depth: int = 0, max_depth: int = 100) -> None:
+    """Check JSON object nesting depth to prevent deeply-nested attacks."""
+    if current_depth > max_depth:
+        raise ValueError(f"JSON nesting depth exceeds maximum of {max_depth}")
+    if isinstance(obj, dict):
+        for v in obj.values():
+            _check_json_depth(v, current_depth + 1, max_depth)
+    elif isinstance(obj, list):
+        for item in obj:
+            _check_json_depth(item, current_depth + 1, max_depth)
+
+
 # ===== MCP Handler =====
 class McpHandler(BaseHTTPRequestHandler):
     """MCP HTTP Handler"""
@@ -633,15 +645,13 @@ class McpHandler(BaseHTTPRequestHandler):
             return
         
         try:
-            # 安全检查：限制 JSON 解析深度和大小
-            # 使用 json.JSONDecoder 并设置最大递归深度
-            decoder = json.JSONDecoder(max_depth=100)
-            request, _ = decoder.raw_decode(body)
+            request = json.loads(body)
+            _check_json_depth(request)
         except json.JSONDecodeError as e:
             self.send_error(400, f"Invalid JSON: {str(e)}")
             return
-        except RecursionError:
-            self.send_error(400, "JSON nesting too deep")
+        except ValueError as e:
+            self.send_error(400, str(e))
             return
 
         if not isinstance(request, dict):
