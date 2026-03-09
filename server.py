@@ -633,9 +633,15 @@ class McpHandler(BaseHTTPRequestHandler):
             return
         
         try:
-            request = json.loads(body)
-        except json.JSONDecodeError:
-            self.send_error(400, "Invalid JSON")
+            # 安全检查：限制 JSON 解析深度和大小
+            # 使用 json.JSONDecoder 并设置最大递归深度
+            decoder = json.JSONDecoder(max_depth=100)
+            request, _ = decoder.raw_decode(body)
+        except json.JSONDecodeError as e:
+            self.send_error(400, f"Invalid JSON: {str(e)}")
+            return
+        except RecursionError:
+            self.send_error(400, "JSON nesting too deep")
             return
 
         if not isinstance(request, dict):
