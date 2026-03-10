@@ -509,3 +509,340 @@ class PptxTools:
                 result["parse_error"] = str(e)
         
         return result
+
+    def list_images(self, session_id: str, slide_index=None):
+        """列出演示文稿中的所有图片"""
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+        session = self.sessions.get(session_id)
+        with session.lock:
+            prs = session.presentation
+            if slide_index is not None:
+                if slide_index < 0 or slide_index >= len(prs.slides):
+                    raise ValueError(f"幻灯片索引越界: {slide_index}")
+                slides_to_check = [(slide_index, prs.slides[slide_index])]
+            else:
+                slides_to_check = list(enumerate(prs.slides))
+            images = []
+            for s_idx, slide in slides_to_check:
+                for sh_idx, shape in enumerate(slide.shapes):
+                    if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                        try:
+                            content_type = shape.image.content_type
+                        except Exception:
+                            content_type = "unknown"
+                        alt_text = shape.name or ""
+                        try:
+                            cNvPr = shape._element.find(
+                                ".//{http://schemas.openxmlformats.org/drawingml/2006/main}cNvPr"
+                            )
+                            if cNvPr is not None:
+                                alt_text = cNvPr.get("descr", shape.name or "")
+                        except Exception:
+                            pass
+                        images.append({
+                            "slide_index": s_idx,
+                            "shape_index": sh_idx,
+                            "name": shape.name,
+                            "content_type": content_type,
+                            "left_inches": round(shape.left / 914400, 4) if shape.left else 0,
+                            "top_inches": round(shape.top / 914400, 4) if shape.top else 0,
+                            "width_inches": round(shape.width / 914400, 4) if shape.width else 0,
+                            "height_inches": round(shape.height / 914400, 4) if shape.height else 0,
+                            "z_order": sh_idx,
+                            "alt_text": alt_text,
+                        })
+            return {"session_id": session_id, "total_images": len(images), "images": images}
+
+    def export_images(self, session_id: str, slide_index=None):
+        """导出图片到临时目录"""
+        import os
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+        session = self.sessions.get(session_id)
+        with session.lock:
+            prs = session.presentation
+            if slide_index is not None:
+                if slide_index < 0 or slide_index >= len(prs.slides):
+                    raise ValueError(f"幻灯片索引越界: {slide_index}")
+                slides_to_check = [(slide_index, prs.slides[slide_index])]
+            else:
+                slides_to_check = list(enumerate(prs.slides))
+            exported = []
+            ext_map = {
+                "image/jpeg": "jpg", "image/jpg": "jpg", "image/png": "png",
+                "image/gif": "gif", "image/bmp": "bmp", "image/tiff": "tiff",
+                "image/x-emf": "emf", "image/x-wmf": "wmf",
+            }
+            for s_idx, slide in slides_to_check:
+                for sh_idx, shape in enumerate(slide.shapes):
+                    if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                        try:
+                            img_blob = shape.image.blob
+                            content_type = shape.image.content_type
+                            ext = ext_map.get(content_type.lower(), "bin")
+                            export_dir = os.path.join(self.work_dir, "exported_images", session_id)
+                            os.makedirs(export_dir, exist_ok=True)
+                            raw_name = f"slide{s_idx}_shape{sh_idx}_{shape.name}.{ext}"
+                            filename = "".join(c if c.isalnum() or c in "._-" else "_" for c in raw_name)
+                            file_path = os.path.join(export_dir, filename)
+                            with open(file_path, "wb") as f:
+                                f.write(img_blob)
+                            exported.append({
+                                "slide_index": s_idx,
+                                "shape_index": sh_idx,
+                                "name": shape.name,
+                                "content_type": content_type,
+                                "file_path": file_path,
+                                "left_inches": round(shape.left / 914400, 4) if shape.left else 0,
+                                "top_inches": round(shape.top / 914400, 4) if shape.top else 0,
+                                "width_inches": round(shape.width / 914400, 4) if shape.width else 0,
+                                "height_inches": round(shape.height / 914400, 4) if shape.height else 0,
+                            })
+                        except Exception as e:
+                            log.warning(f"导出图片失败 slide={s_idx} shape={sh_idx}: {e}")
+            return {"session_id": session_id, "exported_count": len(exported), "images": exported}
+
+    def _estimate_shape_role(self, shape, bbox, pw, ph):
+        """启发式估计 shape 语义角色"""
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+        if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+            area_ratio = (bbox["width"] * bbox["height"]) / max(pw * ph, 0.001)
+            if area_ratio > 0.3:
+                return "hero_image"
+            elif area_ratio < 0.05:
+                return "icon_or_logo"
+            return "image"
+        if hasattr(shape, "text") and shape.text:
+            text = shape.text.strip()
+            try:
+                from pptx.enum.shapes import PP_PLACEHOLDER
+                if hasattr(shape, "placeholder_format") and shape.placeholder_format:
+                    pt = shape.placeholder_format.type
+                    if pt in (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE):
+                        return "title"
+                    if pt == PP_PLACEHOLDER.SUBTITLE:
+                        return "subtitle"
+                    if pt == PP_PLACEHOLDER.BODY:
+                        return "body"
+            except Exception:
+                pass
+            if bbox["top"] < ph * 0.2 and bbox["height"] < ph * 0.15:
+                return "title"
+            if bbox["top"] < ph * 0.35 and len(text) < 100:
+                return "subtitle_or_heading"
+            area_ratio = (bbox["width"] * bbox["height"]) / max(pw * ph, 0.001)
+            if area_ratio > 0.2:
+                return "body"
+            return "caption_or_label"
+        return "decorative_shape"
+
+    def _analyze_layout(self, elements, pw, ph):
+        """简单布局分析"""
+        if not elements:
+            return {"reading_order": [], "whitespace_ratio": 1.0, "density_score": 0.0}
+        def rk(i):
+            b = elements[i]["bbox"]
+            return (int(b["top"] / max(ph / 10, 0.001)), b["left"] / max(pw, 0.001))
+        reading_order = sorted(range(len(elements)), key=rk)
+        covered = sum(e["bbox"]["width"] * e["bbox"]["height"] for e in elements)
+        total = max(pw * ph, 0.001)
+        density = min(1.0, covered / total)
+        return {
+            "reading_order": reading_order,
+            "whitespace_ratio": round(max(0, 1 - density), 3),
+            "density_score": round(density, 3),
+        }
+
+    def describe_slide(self, session_id: str, slide_index: int):
+        """返回 slide 的结构化布局描述"""
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+        session = self.sessions.get(session_id)
+        with session.lock:
+            prs = session.presentation
+            if slide_index < 0 or slide_index >= len(prs.slides):
+                raise ValueError(f"幻灯片索引越界: {slide_index}")
+            slide = prs.slides[slide_index]
+            pw = prs.slide_width / 914400
+            ph = prs.slide_height / 914400
+            bg_info = {"type": "default", "color": None}
+            try:
+                fill = slide.background.fill
+                if fill.type is not None:
+                    bg_info["type"] = str(fill.type)
+                    try:
+                        bg_info["color"] = f"#{fill.fore_color.rgb}"
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            elements = []
+            for sh_idx, shape in enumerate(slide.shapes):
+                bbox = {
+                    "left": round(shape.left / 914400, 4) if shape.left else 0,
+                    "top": round(shape.top / 914400, 4) if shape.top else 0,
+                    "width": round(shape.width / 914400, 4) if shape.width else 0,
+                    "height": round(shape.height / 914400, 4) if shape.height else 0,
+                }
+                text_content = ""
+                font_info = None
+                if hasattr(shape, "text") and shape.text:
+                    text_content = shape.text[:500]
+                    try:
+                        tf = shape.text_frame
+                        if tf.paragraphs and tf.paragraphs[0].runs:
+                            run = tf.paragraphs[0].runs[0]
+                            font_info = {
+                                "size_pt": run.font.size.pt if run.font.size else None,
+                                "bold": run.font.bold,
+                                "italic": run.font.italic,
+                            }
+                    except Exception:
+                        pass
+                image_ref = None
+                if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                    try:
+                        image_ref = {
+                            "content_type": shape.image.content_type,
+                            "size_bytes": len(shape.image.blob),
+                        }
+                    except Exception:
+                        image_ref = {"content_type": "unknown", "size_bytes": 0}
+                elements.append({
+                    "shape_index": sh_idx,
+                    "type": str(shape.shape_type),
+                    "name": shape.name,
+                    "bbox": bbox,
+                    "z_order": sh_idx,
+                    "text": text_content,
+                    "font_info": font_info,
+                    "image_ref": image_ref,
+                    "estimated_role": self._estimate_shape_role(shape, bbox, pw, ph),
+                })
+            return {
+                "session_id": session_id,
+                "slide_index": slide_index,
+                "page_size": {"width_inches": round(pw, 4), "height_inches": round(ph, 4)},
+                "background": bg_info,
+                "element_count": len(elements),
+                "elements": elements,
+                "layout_analysis": self._analyze_layout(elements, pw, ph),
+            }
+
+    def export_slide_snapshot(self, session_id: str, slide_index: int):
+        """导出 slide 结构化快照（fallback 方案）"""
+        desc = self.describe_slide(session_id, slide_index)
+        exp = self.export_images(session_id, slide_index=slide_index)
+        return {
+            "session_id": session_id,
+            "slide_index": slide_index,
+            "snapshot_type": "structural_layout",
+            "note": "直接 PNG 渲染需要 LibreOffice 等额外依赖，返回结构化布局 JSON + 图片资源作为 fallback",
+            "page_size": desc["page_size"],
+            "background": desc["background"],
+            "element_count": desc["element_count"],
+            "elements": desc["elements"],
+            "layout_analysis": desc["layout_analysis"],
+            "exported_images": exp["images"],
+        }
+
+    def get_animation_info(self, session_id: str, slide_index: int):
+        """获取 slide 动画和 transition 信息（通过 XML 解析）"""
+        session = self.sessions.get(session_id)
+        with session.lock:
+            prs = session.presentation
+            if slide_index < 0 or slide_index >= len(prs.slides):
+                raise ValueError(f"幻灯片索引越界: {slide_index}")
+            slide = prs.slides[slide_index]
+            slide_elem = slide._element
+            PML = "http://schemas.openxmlformats.org/presentationml/2006/main"
+
+            # Transition
+            trans_elem = slide_elem.find(f"{{{PML}}}transition")
+            has_transition = trans_elem is not None
+            transition_info = None
+            if has_transition:
+                transition_info = {
+                    "type": "unknown",
+                    "duration_ms": None,
+                    "advance_on_click": trans_elem.get("advClick", "true").lower() != "false",
+                    "advance_after_time_ms": None,
+                }
+                dur = trans_elem.get("dur")
+                if dur:
+                    try:
+                        transition_info["duration_ms"] = int(dur)
+                    except ValueError:
+                        transition_info["duration_ms"] = dur
+                adv_tm = trans_elem.get("advTm")
+                if adv_tm:
+                    try:
+                        transition_info["advance_after_time_ms"] = int(adv_tm)
+                    except ValueError:
+                        transition_info["advance_after_time_ms"] = adv_tm
+                for child in trans_elem:
+                    tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+                    if tag != "extLst":
+                        transition_info["type"] = tag
+                        break
+
+            # Animations
+            animations = []
+            animated_shape_indices = set()
+            timing_elem = slide_elem.find(f"{{{PML}}}timing")
+            if timing_elem is not None:
+                order = 0
+                for par in timing_elem.iter(f"{{{PML}}}par"):
+                    for tgt in par.findall(f".//{{{PML}}}spTgt"):
+                        sp_id = tgt.get("spid")
+                        shape_name = None
+                        shape_idx = None
+                        if sp_id:
+                            for idx, sh in enumerate(slide.shapes):
+                                try:
+                                    if str(sh.shape_id) == str(sp_id):
+                                        shape_name = sh.name
+                                        shape_idx = idx
+                                        animated_shape_indices.add(idx)
+                                        break
+                                except Exception:
+                                    pass
+                        trigger = "onClick"
+                        delay_ms = 0
+                        duration_ms = None
+                        cTn = par.find(f".//{{{PML}}}cTn")
+                        if cTn is not None:
+                            try:
+                                d = cTn.get("delay", "0")
+                                if d and d != "indefinite":
+                                    delay_ms = int(d)
+                                dv = cTn.get("dur")
+                                if dv and dv != "indefinite":
+                                    duration_ms = int(dv)
+                            except Exception:
+                                pass
+                        effect_type = "unknown"
+                        for el in par.iter():
+                            tag = el.tag.split("}")[-1] if "}" in el.tag else el.tag
+                            if tag in ("animEffect", "anim", "animMotion", "animScale", "animRot", "set"):
+                                effect_type = tag
+                                break
+                        animations.append({
+                            "order": order,
+                            "shape_name": shape_name,
+                            "shape_index": shape_idx,
+                            "effect_type": effect_type,
+                            "trigger": trigger,
+                            "duration_ms": duration_ms,
+                            "delay_ms": delay_ms,
+                        })
+                        order += 1
+            return {
+                "session_id": session_id,
+                "slide_index": slide_index,
+                "has_animations": len(animations) > 0,
+                "has_transition": has_transition,
+                "transition_info": transition_info,
+                "animation_count": len(animations),
+                "animations": animations,
+                "animated_shape_indices": sorted(animated_shape_indices),
+            }
+
