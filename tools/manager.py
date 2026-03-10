@@ -586,13 +586,14 @@ class PptxTools:
                     except Exception:
                         pass
 
-    def _build_image_info(self, s_idx: int, sh_idx: int, shape) -> Dict[str, Any]:
+    def _build_image_info(self, s_idx: int, sh_idx: int, shape, nested_index: Optional[int] = None) -> Dict[str, Any]:
         """构建单个图片 shape 的元数据信息。
 
         Args:
             s_idx: 幻灯片索引
-            sh_idx: shape 在幻灯片中的索引
+            sh_idx: shape 在幻灯片中的索引（group shape 的索引）
             shape: python-pptx shape 对象
+            nested_index: group 内嵌套图片的子索引（可选），用于区分同一 group 中的不同图片
 
         Returns:
             包含图片位置、尺寸、alt text 等信息的字典
@@ -611,8 +612,15 @@ class PptxTools:
                 alt = el.get("descr", shape.name or "")
         except Exception:
             pass
+        # Use a composite index to uniquely identify nested pictures inside
+        # group shapes.  Format: "<group_index>.<nested_index>" when the
+        # picture comes from a group, otherwise the plain shape index.
+        if nested_index is not None:
+            unique_index = f"{sh_idx}.{nested_index}"
+        else:
+            unique_index = sh_idx
         return {
-            "slide_index": s_idx, "shape_index": sh_idx, "name": shape.name,
+            "slide_index": s_idx, "shape_index": unique_index, "name": shape.name,
             "content_type": ct,
             "left_inches": round(shape.left / EMU_PER_INCH, 4) if shape.left else 0,
             "top_inches": round(shape.top / EMU_PER_INCH, 4) if shape.top else 0,
@@ -645,8 +653,8 @@ class PptxTools:
                     if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
                         images.append(self._build_image_info(s_idx, sh_idx, shape))
                     elif shape.shape_type == MSO_SHAPE_TYPE.GROUP:
-                        for nested in self._iter_picture_shapes(shape.shapes):
-                            images.append(self._build_image_info(s_idx, sh_idx, nested))
+                        for ni, nested in enumerate(self._iter_picture_shapes(shape.shapes)):
+                            images.append(self._build_image_info(s_idx, sh_idx, nested, nested_index=ni))
                     elif hasattr(shape, "image"):
                         try:
                             _ = shape.image
@@ -686,12 +694,12 @@ class PptxTools:
         errors: List[Dict[str, Any]] = []
         for s_idx, slide in its:
             for sh_idx, shape in enumerate(slide.shapes):
-                pics: List[Tuple[int, Any]] = []
+                pics: List[Tuple[str, Any]] = []
                 if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
                     pics.append((sh_idx, shape))
                 elif shape.shape_type == MSO_SHAPE_TYPE.GROUP:
-                    for n in self._iter_picture_shapes(shape.shapes):
-                        pics.append((sh_idx, n))
+                    for ni, n in enumerate(self._iter_picture_shapes(shape.shapes)):
+                        pics.append((f"{sh_idx}.{ni}", n))
                 elif hasattr(shape, "image"):
                     try:
                         _ = shape.image
@@ -1031,7 +1039,13 @@ class PptxTools:
             tm = se.find(f"{{{PML}}}timing")
             if tm is not None:
                 order = 0
+                seen_targets: set = set()
                 for par in tm.iter(f"{{{PML}}}par"):
+                    # Skip non-leaf par nodes (containers that have child par
+                    # elements) to avoid double-counting animation targets from
+                    # ancestor containers.
+                    if par.find(f"{{{PML}}}par") is not None:
+                        continue
                     par_cTn = par.find(f"{{{PML}}}cTn")
                     trigger = "onClick"
                     delay_ms = 0
@@ -1053,6 +1067,12 @@ class PptxTools:
                                 pass
                     for tgt in par.findall(f".//{{{PML}}}spTgt"):
                         sp_id = tgt.get("spid")
+                        # Deduplicate by (spid, par element id) to prevent
+                        # the same target being counted more than once.
+                        tgt_key = (sp_id, id(tgt))
+                        if tgt_key in seen_targets:
+                            continue
+                        seen_targets.add(tgt_key)
                         sn = None
                         si = None
                         if sp_id:
