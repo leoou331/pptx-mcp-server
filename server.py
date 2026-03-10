@@ -227,7 +227,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "session_id": {"type": "string", "description": "会话 ID"},
-                "slide_index": {"type": "integer", "description": "幻灯片索引（可选，不填则返回所有幻灯片的图片）"}
+                "slide_index": {"type": "integer", "minimum": 0, "description": "幻灯片索引（可选，不填则返回所有幻灯片的图片）"}
             },
             "required": ["session_id"]
         }
@@ -239,7 +239,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "session_id": {"type": "string", "description": "会话 ID"},
-                "slide_index": {"type": "integer", "description": "幻灯片索引（可选）"}
+                "slide_index": {"type": "integer", "minimum": 0, "description": "幻灯片索引（可选）"}
             },
             "required": ["session_id"]
         }
@@ -251,7 +251,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "session_id": {"type": "string", "description": "会话 ID"},
-                "slide_index": {"type": "integer", "description": "幻灯片索引（0-based）"}
+                "slide_index": {"type": "integer", "minimum": 0, "description": "幻灯片索引（0-based）"}
             },
             "required": ["session_id", "slide_index"]
         }
@@ -263,7 +263,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "session_id": {"type": "string", "description": "会话 ID"},
-                "slide_index": {"type": "integer", "description": "幻灯片索引（0-based）"}
+                "slide_index": {"type": "integer", "minimum": 0, "description": "幻灯片索引（0-based）"}
             },
             "required": ["session_id", "slide_index"]
         }
@@ -275,7 +275,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "session_id": {"type": "string", "description": "会话 ID"},
-                "slide_index": {"type": "integer", "description": "幻灯片索引（0-based）"}
+                "slide_index": {"type": "integer", "minimum": 0, "description": "幻灯片索引（0-based）"}
             },
             "required": ["session_id", "slide_index"]
         }

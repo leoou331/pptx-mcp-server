@@ -5,17 +5,23 @@ PPTX 工具管理器
 修复 P0-1: 使用 Session 级别的锁保护 Presentation 操作
 """
 import os
+import re
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 from pptx import Presentation
-from pptx.util import Inches, Pt
+from pptx.util import Inches, Pt, Emu
+from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
+from pptx.oxml.ns import qn
 
 from security.validator import validate_pptx, safe_path, limits
 from security.session import SessionManager
 from security.tempfile import temp_manager
 
 log = logging.getLogger("pptx-server")
+
+# 常量
+EMU_PER_INCH = 914400
 
 
 class PptxTools:
@@ -24,6 +30,36 @@ class PptxTools:
     def __init__(self, session_manager: SessionManager, work_dir: str):
         self.sessions = session_manager
         self.work_dir = work_dir
+
+    @staticmethod
+    def _validate_slide_index(prs: Presentation, slide_index: int) -> int:
+        """验证并规范化 slide_index 参数。
+
+        将 slide_index 转为 int 并检查是否在有效范围 [0, len(slides)) 内。
+
+        Args:
+            prs: python-pptx Presentation 对象
+            slide_index: 幻灯片索引（0-based）
+
+        Returns:
+            规范化后的 int 类型 slide_index
+
+        Raises:
+            ValueError: slide_index 类型无法转为 int 或超出范围
+        """
+        if not isinstance(slide_index, int):
+            try:
+                slide_index = int(slide_index)
+            except (ValueError, TypeError):
+                raise ValueError(
+                    f"slide_index 必须为整数，收到 {type(slide_index).__name__}: {slide_index!r}"
+                )
+        total = len(prs.slides)
+        if slide_index < 0 or slide_index >= total:
+            raise ValueError(
+                f"slide_index {slide_index} 超出范围 (有效范围: 0-{total - 1})"
+            )
+        return slide_index
     
     def create(self, name: str = "Untitled") -> Dict[str, Any]:
         """
@@ -512,16 +548,31 @@ class PptxTools:
 
 
     def _validate_export_path(self, session_id: str, export_dir: str) -> None:
-        import re as _re, os
-        if not _re.match(r"^[a-zA-Z0-9_-]+$", session_id):
+        """验证导出路径安全性，防止路径遍历攻击。
+
+        Args:
+            session_id: 会话 ID（只允许字母数字和 _-）
+            export_dir: 导出目录路径
+
+        Raises:
+            ValueError: session_id 格式无效或路径遍历检测失败
+        """
+        if not re.match(r"^[a-zA-Z0-9_-]+$", session_id):
             raise ValueError(f"无效的 session_id: {session_id}")
         real_ed = os.path.realpath(export_dir)
         real_wd = os.path.realpath(self.work_dir)
         if not real_ed.startswith(real_wd + os.sep):
             raise ValueError("Path traversal detected")
 
-    def _iter_picture_shapes(self, shapes):
-        from pptx.enum.shapes import MSO_SHAPE_TYPE
+    def _iter_picture_shapes(self, shapes) -> list:
+        """递归遍历 shapes 集合，yield 所有包含图片的 shape（含 Group 内嵌套）。
+
+        Args:
+            shapes: python-pptx shapes 集合
+
+        Yields:
+            包含图片数据的 shape 对象
+        """
         for shape in shapes:
             if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
                 yield shape
@@ -535,15 +586,27 @@ class PptxTools:
                     except Exception:
                         pass
 
-    def _build_image_info(self, s_idx, sh_idx, shape):
+    def _build_image_info(self, s_idx: int, sh_idx: int, shape) -> Dict[str, Any]:
+        """构建单个图片 shape 的元数据信息。
+
+        Args:
+            s_idx: 幻灯片索引
+            sh_idx: shape 在幻灯片中的索引
+            shape: python-pptx shape 对象
+
+        Returns:
+            包含图片位置、尺寸、alt text 等信息的字典
+        """
         try:
             ct = shape.image.content_type
         except Exception:
             ct = "unknown"
         alt = shape.name or ""
         try:
-            from pptx.oxml.ns import qn
+            # 搜索 PML 和 DrawingML 命名空间下的 cNvPr 以获取 alt text
             el = shape._element.find(f".//{qn('p:cNvPr')}")
+            if el is None:
+                el = shape._element.find(f".//{qn('a:cNvPr')}")
             if el is not None:
                 alt = el.get("descr", shape.name or "")
         except Exception:
@@ -551,21 +614,28 @@ class PptxTools:
         return {
             "slide_index": s_idx, "shape_index": sh_idx, "name": shape.name,
             "content_type": ct,
-            "left_inches": round(shape.left / 914400, 4) if shape.left else 0,
-            "top_inches": round(shape.top / 914400, 4) if shape.top else 0,
-            "width_inches": round(shape.width / 914400, 4) if shape.width else 0,
-            "height_inches": round(shape.height / 914400, 4) if shape.height else 0,
+            "left_inches": round(shape.left / EMU_PER_INCH, 4) if shape.left else 0,
+            "top_inches": round(shape.top / EMU_PER_INCH, 4) if shape.top else 0,
+            "width_inches": round(shape.width / EMU_PER_INCH, 4) if shape.width else 0,
+            "height_inches": round(shape.height / EMU_PER_INCH, 4) if shape.height else 0,
             "z_order": sh_idx, "alt_text": alt,
         }
 
-    def list_images(self, session_id: str, slide_index=None):
-        from pptx.enum.shapes import MSO_SHAPE_TYPE
+    def list_images(self, session_id: str, slide_index: Optional[int] = None) -> Dict[str, Any]:
+        """列出演示文稿中的所有图片，返回位置、尺寸、内容类型等信息。
+
+        Args:
+            session_id: 会话 ID
+            slide_index: 幻灯片索引（可选，不填则返回所有幻灯片的图片）
+
+        Returns:
+            包含图片列表和总数的字典
+        """
         session = self.sessions.get(session_id)
         with session.lock:
             prs = session.presentation
             if slide_index is not None:
-                if slide_index < 0 or slide_index >= len(prs.slides):
-                    raise ValueError(f"幻灯片索引越界: {slide_index}")
+                slide_index = self._validate_slide_index(prs, slide_index)
                 slides_to_check = [(slide_index, prs.slides[slide_index])]
             else:
                 slides_to_check = list(enumerate(prs.slides))
@@ -585,27 +655,38 @@ class PptxTools:
                             pass
             return {"session_id": session_id, "total_images": len(images), "images": images}
 
-    def _export_inner(self, prs, session_id: str, slide_index=None) -> list:
-        import os
-        from pptx.enum.shapes import MSO_SHAPE_TYPE
+    def _export_inner(self, prs: Presentation, session_id: str,
+                       slide_index: Optional[int] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """内部方法：将图片 blob 导出到工作目录。
+
+        Args:
+            prs: python-pptx Presentation 对象
+            session_id: 会话 ID
+            slide_index: 幻灯片索引（可选）
+
+        Returns:
+            (exported, errors) 元组：
+            - exported: 成功导出的图片信息列表
+            - errors: 导出失败的错误信息列表
+        """
         ext_map = {
             "image/jpeg": "jpg", "image/jpg": "jpg", "image/png": "png",
             "image/gif": "gif", "image/bmp": "bmp", "image/tiff": "tiff",
             "image/x-emf": "emf", "image/x-wmf": "wmf",
         }
         if slide_index is not None:
-            if slide_index < 0 or slide_index >= len(prs.slides):
-                raise ValueError(f"幻灯片索引越界: {slide_index}")
+            slide_index = self._validate_slide_index(prs, slide_index)
             its = [(slide_index, prs.slides[slide_index])]
         else:
             its = list(enumerate(prs.slides))
         export_dir = os.path.join(self.work_dir, "exported_images", session_id)
         self._validate_export_path(session_id, export_dir)
         os.makedirs(export_dir, exist_ok=True)
-        out = []
+        out: List[Dict[str, Any]] = []
+        errors: List[Dict[str, Any]] = []
         for s_idx, slide in its:
             for sh_idx, shape in enumerate(slide.shapes):
-                pics = []
+                pics: List[Tuple[int, Any]] = []
                 if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
                     pics.append((sh_idx, shape))
                 elif shape.shape_type == MSO_SHAPE_TYPE.GROUP:
@@ -622,10 +703,11 @@ class PptxTools:
                         blob = ps.image.blob
                         ct = ps.image.content_type
                         ext = ext_map.get(ct.lower(), "bin")
+                        raw_name = f"slide{s_idx}_shape{oi}_{ps.name}.{ext}"
                         fn = "".join(
                             c if c.isalnum() or c in "._-" else "_"
-                            for c in f"slide{s_idx}_shape{oi}_{ps.name}.{ext}"
-                        )
+                            for c in raw_name
+                        )[:200]  # 限制文件名长度
                         fp = os.path.join(export_dir, fn)
                         with open(fp, "wb") as f:
                             f.write(blob)
@@ -637,27 +719,57 @@ class PptxTools:
                         out.append({
                             "slide_index": s_idx, "shape_index": oi, "name": ps.name,
                             "content_type": ct, "file_path": fp,
-                            "left_inches": round(ps.left / 914400, 4) if ps.left else 0,
-                            "top_inches": round(ps.top / 914400, 4) if ps.top else 0,
-                            "width_inches": round(ps.width / 914400, 4) if ps.width else 0,
-                            "height_inches": round(ps.height / 914400, 4) if ps.height else 0,
+                            "left_inches": round(ps.left / EMU_PER_INCH, 4) if ps.left else 0,
+                            "top_inches": round(ps.top / EMU_PER_INCH, 4) if ps.top else 0,
+                            "width_inches": round(ps.width / EMU_PER_INCH, 4) if ps.width else 0,
+                            "height_inches": round(ps.height / EMU_PER_INCH, 4) if ps.height else 0,
                         })
                     except Exception as e:
                         log.warning(f"导出图片失败 slide={s_idx} shape={oi}: {e}")
-        return out
+                        errors.append({
+                            "slide_index": s_idx,
+                            "shape_index": oi,
+                            "name": getattr(ps, "name", "unknown"),
+                            "error": str(e),
+                        })
+        return out, errors
 
-    def export_images(self, session_id: str, slide_index=None):
-        """导出图片到工作目录，通过 temp_manager 管理文件生命周期"""
-        import re as _re
-        if not _re.match(r"^[a-zA-Z0-9_-]+$", session_id):
+    def export_images(self, session_id: str, slide_index: Optional[int] = None) -> Dict[str, Any]:
+        """导出图片到工作目录，通过 temp_manager 管理文件生命周期。
+
+        Args:
+            session_id: 会话 ID
+            slide_index: 幻灯片索引（可选）
+
+        Returns:
+            包含导出结果、失败数量和错误详情的字典
+        """
+        if not re.match(r"^[a-zA-Z0-9_-]+$", session_id):
             raise ValueError(f"无效的 session_id: {session_id}")
         session = self.sessions.get(session_id)
         with session.lock:
-            exported = self._export_inner(session.presentation, session_id, slide_index)
-        return {"session_id": session_id, "exported_count": len(exported), "images": exported}
+            exported, errors = self._export_inner(session.presentation, session_id, slide_index)
+        return {
+            "session_id": session_id,
+            "exported_count": len(exported),
+            "failed_count": len(errors),
+            "images": exported,
+            "errors": errors,
+        }
 
-    def _estimate_shape_role(self, shape, bbox, pw, ph):
-        from pptx.enum.shapes import MSO_SHAPE_TYPE
+    def _estimate_shape_role(self, shape, bbox: Dict[str, float],
+                             pw: float, ph: float) -> str:
+        """根据 shape 类型、位置和尺寸估计其语义角色。
+
+        Args:
+            shape: python-pptx shape 对象
+            bbox: 包含 left/top/width/height 的边界框字典（单位：英寸）
+            pw: 页面宽度（英寸）
+            ph: 页面高度（英寸）
+
+        Returns:
+            估计的角色字符串，如 'title', 'body', 'image' 等
+        """
         st = shape.shape_type
         if st == MSO_SHAPE_TYPE.TABLE:
             return "table"
@@ -671,7 +783,6 @@ class PptxTools:
         if hasattr(shape, "text") and shape.text:
             text = shape.text.strip()
             try:
-                from pptx.enum.shapes import PP_PLACEHOLDER
                 if hasattr(shape, "placeholder_format") and shape.placeholder_format:
                     pt = shape.placeholder_format.type
                     if pt in (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE):
@@ -690,16 +801,31 @@ class PptxTools:
             return "body" if ar > 0.2 else "caption_or_label"
         return "decorative_shape"
 
-    def _analyze_layout(self, elements, pw, ph):
+    def _analyze_layout(self, elements: List[Dict[str, Any]],
+                        pw: float, ph: float) -> Dict[str, Any]:
+        """分析幻灯片元素的布局特征，包括阅读顺序、密度和重叠。
+
+        注意：density_score 和 whitespace_ratio 是近似值，不考虑元素间的重叠。
+        当多个元素重叠时，实际覆盖面积小于各元素面积之和，因此密度可能被高估。
+
+        Args:
+            elements: 元素信息列表（每个元素需包含 'bbox' 字段）
+            pw: 页面宽度（英寸）
+            ph: 页面高度（英寸）
+
+        Returns:
+            包含 reading_order, whitespace_ratio, density_score, overlaps 的字典
+        """
         if not elements:
             return {"reading_order": [], "whitespace_ratio": 1.0, "density_score": 0.0, "overlaps": []}
-        def rk(i):
+        def rk(i: int) -> Tuple[int, float]:
             b = elements[i]["bbox"]
             return (int(b["top"] / max(ph / 10, 0.001)), b["left"] / max(pw, 0.001))
         ro = sorted(range(len(elements)), key=rk)
+        # 近似计算：面积之和，未扣除重叠区域
         cov = sum(e["bbox"]["width"] * e["bbox"]["height"] for e in elements)
         d = min(1.0, cov / max(pw * ph, 0.001))
-        def ov(b1, b2):
+        def ov(b1: Dict, b2: Dict) -> bool:
             return not (
                 b1["left"] + b1["width"] <= b2["left"] or
                 b2["left"] + b2["width"] <= b1["left"] or
@@ -723,13 +849,20 @@ class PptxTools:
             "overlaps": ovs,
         }
 
-    def _describe_inner(self, prs, slide_index: int) -> dict:
-        from pptx.enum.shapes import MSO_SHAPE_TYPE
-        if slide_index < 0 or slide_index >= len(prs.slides):
-            raise ValueError(f"幻灯片索引越界: {slide_index}")
+    def _describe_inner(self, prs: Presentation, slide_index: int) -> Dict[str, Any]:
+        """内部方法：构建幻灯片的结构化布局描述。
+
+        Args:
+            prs: python-pptx Presentation 对象
+            slide_index: 幻灯片索引
+
+        Returns:
+            包含元素信息、布局分析等的结构化字典
+        """
+        slide_index = self._validate_slide_index(prs, slide_index)
         slide = prs.slides[slide_index]
-        pw = (prs.slide_width or 9144000) / 914400
-        ph = (prs.slide_height or 6858000) / 914400
+        pw = (prs.slide_width or 9144000) / EMU_PER_INCH
+        ph = (prs.slide_height or 6858000) / EMU_PER_INCH
         bg = {"type": "default", "color": None}
         try:
             fill = slide.background.fill
@@ -744,10 +877,10 @@ class PptxTools:
         elements = []
         for sh_idx, shape in enumerate(slide.shapes):
             bbox = {
-                "left": round(shape.left / 914400, 4) if shape.left else 0,
-                "top": round(shape.top / 914400, 4) if shape.top else 0,
-                "width": round(shape.width / 914400, 4) if shape.width else 0,
-                "height": round(shape.height / 914400, 4) if shape.height else 0,
+                "left": round(shape.left / EMU_PER_INCH, 4) if shape.left else 0,
+                "top": round(shape.top / EMU_PER_INCH, 4) if shape.top else 0,
+                "width": round(shape.width / EMU_PER_INCH, 4) if shape.width else 0,
+                "height": round(shape.height / EMU_PER_INCH, 4) if shape.height else 0,
             }
             text_content = ""
             font_info = None
@@ -792,40 +925,77 @@ class PptxTools:
             "layout_analysis": self._analyze_layout(elements, pw, ph),
         }
 
-    def describe_slide(self, session_id: str, slide_index: int):
-        """返回 slide 的结构化布局描述"""
+    def describe_slide(self, session_id: str, slide_index: int) -> Dict[str, Any]:
+        """返回 slide 的结构化布局描述，含所有元素的位置、类型、文本、图片引用及布局分析。
+
+        Args:
+            session_id: 会话 ID
+            slide_index: 幻灯片索引（0-based）
+
+        Returns:
+            结构化布局描述字典
+        """
         session = self.sessions.get(session_id)
         with session.lock:
+            slide_index = self._validate_slide_index(session.presentation, slide_index)
             r = self._describe_inner(session.presentation, slide_index)
             r["session_id"] = session_id
             return r
 
-    def export_slide_snapshot(self, session_id: str, slide_index: int):
-        """导出 slide 结构化快照（单次加锁，fallback 方案）"""
-        import re as _re
-        if not _re.match(r"^[a-zA-Z0-9_-]+$", session_id):
+    def export_slide_snapshot(self, session_id: str, slide_index: int) -> Dict[str, Any]:
+        """导出 slide 结构化快照（单次加锁，fallback 方案）。
+
+        包含布局 JSON + 图片资源导出，不依赖 LibreOffice。
+
+        Args:
+            session_id: 会话 ID
+            slide_index: 幻灯片索引（0-based）
+
+        Returns:
+            包含布局描述、导出图片和错误信息的字典
+        """
+        if not re.match(r"^[a-zA-Z0-9_-]+$", session_id):
             raise ValueError(f"无效的 session_id: {session_id}")
         session = self.sessions.get(session_id)
         with session.lock:
             prs = session.presentation
+            slide_index = self._validate_slide_index(prs, slide_index)
             desc = self._describe_inner(prs, slide_index)
-            imgs = self._export_inner(prs, session_id, slide_index)
+            imgs, errors = self._export_inner(prs, session_id, slide_index)
         return {
             "session_id": session_id, "slide_index": slide_index,
             "snapshot_type": "structural_layout",
             "note": "PNG rendering requires LibreOffice; returning structural layout JSON + image exports as fallback",
             "page_size": desc["page_size"], "background": desc["background"],
             "element_count": desc["element_count"], "elements": desc["elements"],
-            "layout_analysis": desc["layout_analysis"], "exported_images": imgs,
+            "layout_analysis": desc["layout_analysis"],
+            "exported_images": imgs,
+            "export_failed_count": len(errors),
+            "export_errors": errors,
         }
 
-    def get_animation_info(self, session_id: str, slide_index: int):
-        """获取 slide 动画和 transition 信息（通过解析 PML XML）"""
+    def get_animation_info(self, session_id: str, slide_index: int) -> Dict[str, Any]:
+        """获取 slide 动画和 transition 信息（通过解析 PML XML）。
+
+        Args:
+            session_id: 会话 ID
+            slide_index: 幻灯片索引（0-based）
+
+        Returns:
+            包含动画列表、transition 信息等的字典
+        """
+        # nodeType 到 trigger 的映射表（基于 OOXML 规范）
+        NODE_TYPE_TO_TRIGGER = {
+            "clickEffect": "onClick",
+            "withEffect": "withPrevious",
+            "afterEffect": "afterPrevious",
+            "mainSeq": "mainSequence",
+            "interactiveSeq": "interactive",
+        }
         session = self.sessions.get(session_id)
         with session.lock:
             prs = session.presentation
-            if slide_index < 0 or slide_index >= len(prs.slides):
-                raise ValueError(f"幻灯片索引越界: {slide_index}")
+            slide_index = self._validate_slide_index(prs, slide_index)
             slide = prs.slides[slide_index]
             se = slide._element
             PML = "http://schemas.openxmlformats.org/presentationml/2006/main"
@@ -868,10 +1038,7 @@ class PptxTools:
                     seq_dur = None
                     if par_cTn is not None:
                         nt = par_cTn.get("nodeType", "")
-                        if nt == "withEffect":
-                            trigger = "withPrevious"
-                        elif nt == "afterEffect":
-                            trigger = "afterPrevious"
+                        trigger = NODE_TYPE_TO_TRIGGER.get(nt, "unknown" if nt else "onClick")
                         d = par_cTn.get("delay", "0")
                         if d and d != "indefinite":
                             try:
