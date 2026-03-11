@@ -219,6 +219,66 @@ TOOLS = [
             },
             "required": ["file_path"]
         }
+    },
+    {
+        "name": "pptx_list_images",
+        "description": "列出演示文稿中的所有图片，返回位置、尺寸、内容类型等信息",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "会话 ID"},
+                "slide_index": {"type": "integer", "minimum": 0, "description": "幻灯片索引（可选，不填则返回所有幻灯片的图片）"}
+            },
+            "required": ["session_id"]
+        }
+    },
+    {
+        "name": "pptx_export_images",
+        "description": "导出演示文稿中的图片到临时目录，返回文件路径和元数据",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "会话 ID"},
+                "slide_index": {"type": "integer", "minimum": 0, "description": "幻灯片索引（可选）"}
+            },
+            "required": ["session_id"]
+        }
+    },
+    {
+        "name": "pptx_describe_slide",
+        "description": "返回 slide 的结构化布局描述，含所有元素的位置、类型、文本、图片引用及布局分析",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "会话 ID"},
+                "slide_index": {"type": "integer", "minimum": 0, "description": "幻灯片索引（0-based）"}
+            },
+            "required": ["session_id", "slide_index"]
+        }
+    },
+    {
+        "name": "pptx_export_slide_snapshot",
+        "description": "导出 slide 的结构化快照（含布局 JSON + 图片资源，不依赖 LibreOffice）",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "会话 ID"},
+                "slide_index": {"type": "integer", "minimum": 0, "description": "幻灯片索引（0-based）"}
+            },
+            "required": ["session_id", "slide_index"]
+        }
+    },
+    {
+        "name": "pptx_get_animation_info",
+        "description": "获取 slide 的动画和 transition 信息，含动画顺序、触发方式、时长、延迟",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "会话 ID"},
+                "slide_index": {"type": "integer", "minimum": 0, "description": "幻灯片索引（0-based）"}
+            },
+            "required": ["session_id", "slide_index"]
+        }
     }
 ]
 
@@ -402,6 +462,11 @@ class McpHandler(BaseHTTPRequestHandler):
             "pptx_read_content": self._tool_read_content,
             "pptx_list_slides": self._tool_list_slides,
             "pptx_validate": self._tool_validate,
+            "pptx_list_images": self._tool_list_images,
+            "pptx_export_images": self._tool_export_images,
+            "pptx_describe_slide": self._tool_describe_slide,
+            "pptx_export_slide_snapshot": self._tool_export_slide_snapshot,
+            "pptx_get_animation_info": self._tool_get_animation_info,
         }
         
         if tool_name not in handlers:
@@ -502,7 +567,37 @@ class McpHandler(BaseHTTPRequestHandler):
         return self.tools.validate(
             file_path=args["file_path"]
         )
-    
+
+    def _tool_list_images(self, args: dict) -> dict:
+        return self.tools.list_images(
+            session_id=args["session_id"],
+            slide_index=args.get("slide_index")
+        )
+
+    def _tool_export_images(self, args: dict) -> dict:
+        return self.tools.export_images(
+            session_id=args["session_id"],
+            slide_index=args.get("slide_index")
+        )
+
+    def _tool_describe_slide(self, args: dict) -> dict:
+        return self.tools.describe_slide(
+            session_id=args["session_id"],
+            slide_index=args["slide_index"]
+        )
+
+    def _tool_export_slide_snapshot(self, args: dict) -> dict:
+        return self.tools.export_slide_snapshot(
+            session_id=args["session_id"],
+            slide_index=args["slide_index"]
+        )
+
+    def _tool_get_animation_info(self, args: dict) -> dict:
+        return self.tools.get_animation_info(
+            session_id=args["session_id"],
+            slide_index=args["slide_index"]
+        )
+
     def _send_json(self, req_id, result=None, error=None):
         """发送 JSON 响应"""
         response = {"jsonrpc": "2.0", "id": req_id}
