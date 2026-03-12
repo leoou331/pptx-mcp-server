@@ -5,6 +5,7 @@ PPTX 文件安全验证模块
 import os
 import zipfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Tuple
 
 
@@ -18,6 +19,9 @@ class SecurityLimits:
     MAX_SHAPES_PER_SLIDE: int = 1000
     MAX_IMAGE_SIZE: int = 10 * 1024 * 1024         # 10MB
     MAX_TEXT_LENGTH: int = 100_000
+    MAX_TABLE_ROWS: int = 200
+    MAX_TABLE_COLS: int = 50
+    MAX_TABLE_CELLS: int = 5_000
     PROCESSING_TIMEOUT: int = 60                    # 秒
     SESSION_TTL: int = 3600                         # 1小时
 
@@ -65,10 +69,10 @@ def has_macro(file_path: str) -> bool:
 
 def safe_path(base_dir: str, user_path: str) -> str:
     """
-    防止路径遍历攻击（跨平台安全）
+    将用户路径解析到受控目录内，支持绝对路径白名单校验
     
     Args:
-        base_dir: 基础目录（安全边界）
+        base_dir: 默认基础目录（安全边界）
         user_path: 用户提供的路径
         
     Returns:
@@ -77,36 +81,49 @@ def safe_path(base_dir: str, user_path: str) -> str:
     Raises:
         ValueError: 如果检测到路径遍历攻击
     """
-    # 1. 只使用 basename，忽略用户提供的路径部分
-    safe_name = os.path.basename(user_path)
-    
-    # 2. 禁止特殊字符
-    forbidden_chars = ['..', '~', '$', '|', ';', '&', '\x00']
-    for char in forbidden_chars:
-        if char in safe_name:
-            raise ValueError(f"非法文件名: {safe_name}")
-    
-    # 3. 禁止空文件名
-    if not safe_name or safe_name.strip() == '':
-        raise ValueError("文件名不能为空")
-    
-    # 4. 构建完整路径
-    full_path = os.path.join(base_dir, safe_name)
-    
-    # 5. 解析符号链接，获取真实路径
-    abs_base = os.path.realpath(base_dir)
-    abs_path = os.path.realpath(full_path)
-    
-    # 6. 跨平台前缀检查（使用 commonpath 更可靠）
+    return safe_path_in_dirs(base_dir, user_path)
+
+
+def _is_relative_to(path: Path, base: Path) -> bool:
+    """兼容 Python 3.8+ 的 Path.is_relative_to。"""
     try:
-        common_prefix = os.path.commonpath([abs_base, abs_path])
-        if common_prefix != abs_base:
-            raise ValueError(f"路径遍历攻击检测: {user_path}")
+        path.relative_to(base)
+        return True
     except ValueError:
-        # 如果路径不在同一驱动器上（Windows）
-        raise ValueError(f"非法路径: {user_path}")
-    
-    return abs_path
+        return False
+
+
+def safe_path_in_dirs(base_dir: str, user_path: str, *allowed_dirs: str) -> str:
+    """
+    将路径限制在一个或多个允许目录中，跟随符号链接后再校验边界。
+
+    相对路径会基于 base_dir 解析；绝对路径只有在落入 allowlist 时才允许。
+    """
+    if not isinstance(user_path, str):
+        raise TypeError("文件路径必须是字符串")
+
+    if "\x00" in user_path:
+        raise ValueError("文件路径包含非法空字节")
+
+    cleaned = user_path.strip()
+    if not cleaned:
+        raise ValueError("文件路径不能为空")
+
+    base_path = Path(base_dir).resolve()
+    allowed_paths = [base_path]
+    for directory in allowed_dirs:
+        if directory:
+            allowed_paths.append(Path(directory).resolve())
+
+    raw_path = Path(cleaned)
+    candidate = raw_path if raw_path.is_absolute() else base_path / raw_path
+    resolved = candidate.resolve(strict=False)
+
+    if any(_is_relative_to(resolved, allowed) for allowed in allowed_paths):
+        return str(resolved)
+
+    allowed_str = ", ".join(str(path) for path in allowed_paths)
+    raise ValueError(f"路径不在允许目录内: {cleaned} (allowed: {allowed_str})")
 
 
 def validate_pptx(file_path: str) -> Tuple[bool, str]:
