@@ -1404,6 +1404,7 @@ class PptxTools:
                 shape.fill.fore_color.rgb = parsed_fill
 
             if parsed_line is not None:
+                shape.line.fill.solid()
                 shape.line.color.rgb = parsed_line
 
             session.dirty = True
@@ -1539,12 +1540,12 @@ class PptxTools:
         top: Optional[int] = None,
         width: Optional[int] = None,
         height: Optional[int] = None,
-        font_size: int = 18,
+        font_size: Optional[int] = None,
         font_name: Optional[str] = None,
-        bold: bool = False,
-        italic: bool = False,
+        bold: Optional[bool] = None,
+        italic: Optional[bool] = None,
         color: Optional[str] = None,
-        alignment: str = "left",
+        alignment: Optional[str] = None,
         shape_index: Optional[int] = None,
     ) -> Dict[str, Any]:
         """统一文本管理：添加文本框、格式化现有形状文本、提取文本。
@@ -1608,6 +1609,16 @@ class PptxTools:
         if int(height) <= 0:
             raise ValueError("height 必须大于 0")
 
+        # add 操作使用默认值（用户未指定时）
+        if font_size is None:
+            font_size = 18
+        if bold is None:
+            bold = False
+        if italic is None:
+            italic = False
+        if alignment is None:
+            alignment = "left"
+
         if not isinstance(font_size, int) or isinstance(font_size, bool):
             raise TypeError("font_size 必须是整数")
         if font_size < 1 or font_size > self.MAX_FONT_SIZE:
@@ -1670,8 +1681,9 @@ class PptxTools:
         pp_align = None
         if alignment is not None:
             align_key = alignment.strip().lower() if isinstance(alignment, str) else ""
-            if align_key and align_key in self._ALIGNMENT_MAP:
-                pp_align = self._ALIGNMENT_MAP[align_key]
+            if align_key not in self._ALIGNMENT_MAP:
+                raise ValueError(f"无效的 alignment: {alignment!r}")
+            pp_align = self._ALIGNMENT_MAP[align_key]
 
         with session.lock:
             prs = session.presentation

@@ -350,12 +350,12 @@ TOOLS = [
                 "top": {"type": "integer", "description": "上边距 EMU（add 时必填）"},
                 "width": {"type": "integer", "description": "宽度 EMU（add 时必填）"},
                 "height": {"type": "integer", "description": "高度 EMU（add 时必填）"},
-                "font_size": {"type": "integer", "default": 18, "description": "字号"},
+                "font_size": {"type": "integer", "description": "字号（可选，不传则保留原格式）"},
                 "font_name": {"type": "string", "description": "字体名称（可选）"},
-                "bold": {"type": "boolean", "default": False, "description": "是否加粗"},
-                "italic": {"type": "boolean", "default": False, "description": "是否斜体"},
+                "bold": {"type": "boolean", "description": "是否加粗（可选，不传则保留原格式）"},
+                "italic": {"type": "boolean", "description": "是否斜体（可选，不传则保留原格式）"},
                 "color": {"type": "string", "description": "十六进制颜色如 FF0000（可选）"},
-                "alignment": {"type": "string", "enum": ["left", "center", "right", "justify"], "default": "left"},
+                "alignment": {"type": "string", "enum": ["left", "center", "right", "justify"], "description": "对齐方式（可选，不传则保留原格式）"},
                 "shape_index": {"type": "integer", "description": "形状索引（format 时必填）"}
             },
             "required": ["session_id", "operation"]
@@ -863,12 +863,12 @@ class McpHandler(BaseHTTPRequestHandler):
             top=args.get("top"),
             width=args.get("width"),
             height=args.get("height"),
-            font_size=args.get("font_size", 18),
+            font_size=args.get("font_size"),
             font_name=args.get("font_name"),
-            bold=args.get("bold", False),
-            italic=args.get("italic", False),
+            bold=args.get("bold"),
+            italic=args.get("italic"),
             color=args.get("color"),
-            alignment=args.get("alignment", "left"),
+            alignment=args.get("alignment"),
             shape_index=args.get("shape_index"),
         )
 
