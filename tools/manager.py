@@ -14,6 +14,11 @@ from typing import Dict, Any, List, Optional, Tuple
 
 from PIL import Image, UnidentifiedImageError
 from pptx import Presentation
+from pptx.chart.data import ChartData
+from pptx.dml.color import RGBColor
+from pptx.enum.chart import XL_CHART_TYPE
+from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
+from pptx.enum.text import PP_ALIGN
 from pptx.util import Inches, Pt, Emu
 from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
 from pptx.oxml.ns import qn
@@ -1247,4 +1252,422 @@ class PptxTools:
                 "has_animations": len(anims) > 0, "has_transition": has_t,
                 "transition_info": ti, "animation_count": len(anims),
                 "animations": anims, "animated_shape_indices": sorted(anis),
+            }
+
+    def add_shape(
+        self,
+        session_id: str,
+        slide_index: int,
+        shape_type: str,
+        left: float,
+        top: float,
+        width: float,
+        height: float,
+        text: Optional[str] = None,
+        fill_color: Optional[str] = None,
+        line_color: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """在幻灯片上添加自动形状"""
+        SHAPE_MAP = {
+            "rectangle": MSO_AUTO_SHAPE_TYPE.RECTANGLE,
+            "oval": MSO_AUTO_SHAPE_TYPE.OVAL,
+            "triangle": MSO_AUTO_SHAPE_TYPE.ISOSCELES_TRIANGLE,
+            "right_arrow": MSO_AUTO_SHAPE_TYPE.RIGHT_ARROW,
+            "left_arrow": MSO_AUTO_SHAPE_TYPE.LEFT_ARROW,
+            "up_arrow": MSO_AUTO_SHAPE_TYPE.UP_ARROW,
+            "down_arrow": MSO_AUTO_SHAPE_TYPE.DOWN_ARROW,
+            "pentagon": MSO_AUTO_SHAPE_TYPE.PENTAGON,
+            "hexagon": MSO_AUTO_SHAPE_TYPE.HEXAGON,
+            "star5": MSO_AUTO_SHAPE_TYPE.STAR_5_POINT,
+            "rounded_rectangle": MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE,
+            "cloud": MSO_AUTO_SHAPE_TYPE.CLOUD,
+            "heart": MSO_AUTO_SHAPE_TYPE.HEART,
+            "lightning_bolt": MSO_AUTO_SHAPE_TYPE.LIGHTNING_BOLT,
+            "diamond": MSO_AUTO_SHAPE_TYPE.DIAMOND,
+            "parallelogram": MSO_AUTO_SHAPE_TYPE.PARALLELOGRAM,
+            "trapezoid": MSO_AUTO_SHAPE_TYPE.TRAPEZOID,
+            "chevron": MSO_AUTO_SHAPE_TYPE.CHEVRON,
+            "flowchart_process": MSO_AUTO_SHAPE_TYPE.FLOWCHART_PROCESS,
+            "flowchart_decision": MSO_AUTO_SHAPE_TYPE.FLOWCHART_DECISION,
+            "arrow": MSO_AUTO_SHAPE_TYPE.RIGHT_ARROW,
+        }
+        session = self.sessions.get(session_id)
+        if not isinstance(shape_type, str):
+            raise TypeError("shape_type 必须是字符串")
+        shape_type_lower = shape_type.lower()
+        if shape_type_lower not in SHAPE_MAP:
+            valid = ", ".join(sorted(SHAPE_MAP.keys()))
+            raise ValueError(f"不支持的形状类型: {shape_type!r}，支持的类型: {valid}")
+        left = self._validate_non_negative(left, "left")
+        top = self._validate_non_negative(top, "top")
+        width = self._validate_positive(width, "width")
+        height = self._validate_positive(height, "height")
+        if text is not None and not isinstance(text, str):
+            raise TypeError("text 必须是字符串")
+        if text is not None and len(text) > limits.MAX_TEXT_LENGTH:
+            raise ValueError(f"text 过长: {len(text)} > {limits.MAX_TEXT_LENGTH}")
+
+        def _parse_color(hex_str: str) -> RGBColor:
+            hex_str = hex_str.lstrip("#")
+            if len(hex_str) != 6:
+                raise ValueError(f"颜色格式无效，请使用 '#RRGGBB' 格式: #{hex_str!r}")
+            try:
+                r = int(hex_str[0:2], 16)
+                g = int(hex_str[2:4], 16)
+                b = int(hex_str[4:6], 16)
+            except ValueError as exc:
+                raise ValueError(f"颜色值无效: #{hex_str!r}") from exc
+            return RGBColor(r, g, b)
+
+        with session.lock:
+            prs = session.presentation
+            slide_index = self._validate_slide_index(prs, slide_index)
+            slide = prs.slides[slide_index]
+            auto_shape_type = SHAPE_MAP[shape_type_lower]
+            shape = slide.shapes.add_shape(
+                auto_shape_type,
+                Inches(left), Inches(top), Inches(width), Inches(height),
+            )
+            if fill_color:
+                shape.fill.solid()
+                shape.fill.fore_color.rgb = _parse_color(fill_color)
+            if line_color:
+                shape.line.color.rgb = _parse_color(line_color)
+            if text:
+                shape.text_frame.text = text
+            session.dirty = True
+            return {
+                "slide_index": slide_index,
+                "shape_type": shape_type_lower,
+                "left": left,
+                "top": top,
+                "width": width,
+                "height": height,
+                "has_text": text is not None,
+                "message": "形状已添加",
+            }
+
+    def add_chart(
+        self,
+        session_id: str,
+        slide_index: int,
+        chart_type: str,
+        categories: list,
+        series_data: list,
+        left: float = 1.0,
+        top: float = 2.0,
+        width: float = 8.0,
+        height: float = 5.0,
+        title: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """在幻灯片上添加图表（bar/column/line/pie）"""
+        CHART_TYPE_MAP = {
+            "bar": XL_CHART_TYPE.BAR_CLUSTERED,
+            "column": XL_CHART_TYPE.COLUMN_CLUSTERED,
+            "line": XL_CHART_TYPE.LINE,
+            "pie": XL_CHART_TYPE.PIE,
+        }
+        session = self.sessions.get(session_id)
+        if not isinstance(chart_type, str):
+            raise TypeError("chart_type 必须是字符串")
+        chart_type_lower = chart_type.lower()
+        if chart_type_lower not in CHART_TYPE_MAP:
+            raise ValueError(f"不支持的图表类型: {chart_type!r}，支持: bar, column, line, pie")
+        if not isinstance(categories, list) or len(categories) == 0:
+            raise ValueError("categories 必须是非空列表")
+        if len(categories) > 1000:
+            raise ValueError(f"categories 过多: {len(categories)} > 1000")
+        if not isinstance(series_data, list) or len(series_data) == 0:
+            raise ValueError("series_data 必须是非空列表")
+        if len(series_data) > 50:
+            raise ValueError(f"系列数量过多: {len(series_data)} > 50")
+        for i, series in enumerate(series_data):
+            if not isinstance(series, dict):
+                raise TypeError(f"series_data[{i}] 必须是字典")
+            if "name" not in series:
+                raise ValueError(f"series_data[{i}] 缺少 'name' 字段")
+            if "values" not in series:
+                raise ValueError(f"series_data[{i}] 缺少 'values' 字段")
+            if not isinstance(series["values"], list):
+                raise TypeError(f"series_data[{i}]['values'] 必须是列表")
+            if len(series["values"]) != len(categories):
+                raise ValueError(
+                    f"series_data[{i}]['values'] 长度 {len(series['values'])} "
+                    f"与 categories 长度 {len(categories)} 不一致"
+                )
+        if title is not None and not isinstance(title, str):
+            raise TypeError("title 必须是字符串")
+        left = self._validate_non_negative(left, "left")
+        top = self._validate_non_negative(top, "top")
+        width = self._validate_positive(width, "width")
+        height = self._validate_positive(height, "height")
+        with session.lock:
+            prs = session.presentation
+            slide_index = self._validate_slide_index(prs, slide_index)
+            slide = prs.slides[slide_index]
+            chart_data = ChartData()
+            chart_data.categories = [str(c) for c in categories]
+            for series in series_data:
+                chart_data.add_series(str(series["name"]), series["values"])
+            xl_chart_type = CHART_TYPE_MAP[chart_type_lower]
+            chart_frame = slide.shapes.add_chart(
+                xl_chart_type,
+                Inches(left), Inches(top), Inches(width), Inches(height),
+                chart_data,
+            )
+            if title:
+                chart = chart_frame.chart
+                chart.has_title = True
+                chart.chart_title.text_frame.text = title
+            session.dirty = True
+            return {
+                "slide_index": slide_index,
+                "chart_type": chart_type_lower,
+                "categories_count": len(categories),
+                "series_count": len(series_data),
+                "has_title": title is not None,
+                "message": "图表已添加",
+            }
+
+    def manage_text(
+        self,
+        session_id: str,
+        operation: str,
+        slide_index: Optional[int] = None,
+        text: Optional[str] = None,
+        left: float = 1.0,
+        top: float = 1.0,
+        width: float = 8.0,
+        height: float = 1.0,
+        font_size: Optional[int] = None,
+        font_name: Optional[str] = None,
+        bold: Optional[bool] = None,
+        italic: Optional[bool] = None,
+        color: Optional[str] = None,
+        alignment: Optional[str] = None,
+        shape_index: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """统一文本管理：add（添加文本框）/ format（格式化）/ extract（提取）"""
+        ALIGNMENT_MAP = {
+            "left": PP_ALIGN.LEFT,
+            "center": PP_ALIGN.CENTER,
+            "right": PP_ALIGN.RIGHT,
+            "justify": PP_ALIGN.JUSTIFY,
+        }
+        if not isinstance(operation, str):
+            raise TypeError("operation 必须是字符串")
+        op = operation.lower()
+        if op not in ("add", "format", "extract"):
+            raise ValueError(f"不支持的操作: {operation!r}，支持: add, format, extract")
+        session = self.sessions.get(session_id)
+
+        def _parse_color(hex_str: str) -> RGBColor:
+            hex_str = hex_str.lstrip("#")
+            if len(hex_str) != 6:
+                raise ValueError(f"颜色格式无效: #{hex_str!r}，请使用 '#RRGGBB'")
+            try:
+                r = int(hex_str[0:2], 16)
+                g = int(hex_str[2:4], 16)
+                b = int(hex_str[4:6], 16)
+            except ValueError as exc:
+                raise ValueError(f"颜色值无效: #{hex_str!r}") from exc
+            return RGBColor(r, g, b)
+
+        def _apply_text_format(text_frame, fs, fn, bld, itl, clr, aln):
+            align_enum = None
+            if aln:
+                aln_lower = aln.lower()
+                if aln_lower not in ALIGNMENT_MAP:
+                    raise ValueError(f"不支持的对齐方式: {aln!r}，支持: left, center, right, justify")
+                align_enum = ALIGNMENT_MAP[aln_lower]
+            for para in text_frame.paragraphs:
+                if align_enum is not None:
+                    para.alignment = align_enum
+                for run in para.runs:
+                    if fs is not None:
+                        run.font.size = Pt(fs)
+                    if fn is not None:
+                        run.font.name = fn
+                    if bld is not None:
+                        run.font.bold = bld
+                    if itl is not None:
+                        run.font.italic = itl
+                    if clr is not None:
+                        run.font.color.rgb = _parse_color(clr)
+
+        with session.lock:
+            prs = session.presentation
+            if op == "add":
+                if text is None:
+                    raise ValueError("add 操作必须提供 text 参数")
+                if not isinstance(text, str):
+                    raise TypeError("text 必须是字符串")
+                if len(text) > limits.MAX_TEXT_LENGTH:
+                    raise ValueError(f"text 过长: {len(text)} > {limits.MAX_TEXT_LENGTH}")
+                if slide_index is None:
+                    raise ValueError("add 操作必须提供 slide_index")
+                idx = self._validate_slide_index(prs, slide_index)
+                left_v = self._validate_non_negative(left, "left")
+                top_v = self._validate_non_negative(top, "top")
+                width_v = self._validate_positive(width, "width")
+                height_v = self._validate_positive(height, "height")
+                if font_size is not None:
+                    font_size = self._validate_int(font_size, "font_size", minimum=1)
+                    if font_size > self.MAX_FONT_SIZE:
+                        raise ValueError(f"font_size 过大: {font_size} > {self.MAX_FONT_SIZE}")
+                slide = prs.slides[idx]
+                text_box = slide.shapes.add_textbox(
+                    Inches(left_v), Inches(top_v), Inches(width_v), Inches(height_v)
+                )
+                tf = text_box.text_frame
+                tf.text = text
+                _apply_text_format(tf, font_size, font_name, bold, italic, color, alignment)
+                session.dirty = True
+                return {
+                    "operation": "add",
+                    "slide_index": idx,
+                    "text_length": len(text),
+                    "message": "文本框已添加",
+                }
+            if op == "format":
+                if slide_index is None:
+                    raise ValueError("format 操作必须提供 slide_index")
+                if shape_index is None:
+                    raise ValueError("format 操作必须提供 shape_index")
+                idx = self._validate_slide_index(prs, slide_index)
+                shape_idx = self._validate_int(shape_index, "shape_index")
+                if font_size is not None:
+                    font_size = self._validate_int(font_size, "font_size", minimum=1)
+                    if font_size > self.MAX_FONT_SIZE:
+                        raise ValueError(f"font_size 过大: {font_size} > {self.MAX_FONT_SIZE}")
+                slide = prs.slides[idx]
+                shapes = slide.shapes
+                if shape_idx >= len(shapes):
+                    raise ValueError(f"shape_index {shape_idx} 超出范围 (共 {len(shapes)} 个形状)")
+                shape = shapes[shape_idx]
+                if not shape.has_text_frame:
+                    raise ValueError(f"shape_index {shape_idx} 没有文本框，无法格式化文本")
+                _apply_text_format(shape.text_frame, font_size, font_name, bold, italic, color, alignment)
+                session.dirty = True
+                return {
+                    "operation": "format",
+                    "slide_index": idx,
+                    "shape_index": shape_idx,
+                    "message": "文本格式已更新",
+                }
+
+            def _extract_slide_texts(slide_obj, s_idx):
+                res = {"slide_index": s_idx, "shapes": []}
+                for sh_i, sh in enumerate(slide_obj.shapes):
+                    if sh.has_text_frame:
+                        res["shapes"].append({
+                            "shape_index": sh_i,
+                            "shape_name": sh.name,
+                            "text": sh.text_frame.text,
+                        })
+                return res
+
+            if slide_index is not None:
+                idx = self._validate_slide_index(prs, slide_index)
+                return {
+                    "operation": "extract",
+                    "slide_index": idx,
+                    "data": _extract_slide_texts(prs.slides[idx], idx),
+                    "message": "文本已提取",
+                }
+
+            all_data = [_extract_slide_texts(s, i) for i, s in enumerate(prs.slides)]
+            return {
+                "operation": "extract",
+                "total_slides": len(prs.slides),
+                "data": all_data,
+                "message": "全部文本已提取",
+            }
+
+    def format_table_cell(
+        self,
+        session_id: str,
+        slide_index: int,
+        shape_index: int,
+        row: int,
+        col: int,
+        text: Optional[str] = None,
+        font_size: Optional[int] = None,
+        bold: Optional[bool] = None,
+        fill_color: Optional[str] = None,
+        alignment: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """格式化表格单元格（文本/字号/加粗/填充色/对齐）"""
+        ALIGNMENT_MAP = {
+            "left": PP_ALIGN.LEFT,
+            "center": PP_ALIGN.CENTER,
+            "right": PP_ALIGN.RIGHT,
+        }
+        session = self.sessions.get(session_id)
+        row = self._validate_int(row, "row")
+        col = self._validate_int(col, "col")
+        shape_index = self._validate_int(shape_index, "shape_index")
+        if font_size is not None:
+            font_size = self._validate_int(font_size, "font_size", minimum=1)
+            if font_size > self.MAX_FONT_SIZE:
+                raise ValueError(f"font_size 过大: {font_size} > {self.MAX_FONT_SIZE}")
+        if text is not None and not isinstance(text, str):
+            raise TypeError("text 必须是字符串")
+        if bold is not None and not isinstance(bold, bool):
+            raise TypeError("bold 必须是布尔值")
+
+        def _parse_color(hex_str: str) -> RGBColor:
+            hex_str = hex_str.lstrip("#")
+            if len(hex_str) != 6:
+                raise ValueError(f"颜色格式无效: #{hex_str!r}")
+            try:
+                r = int(hex_str[0:2], 16)
+                g = int(hex_str[2:4], 16)
+                b = int(hex_str[4:6], 16)
+            except ValueError as exc:
+                raise ValueError(f"颜色值无效: #{hex_str!r}") from exc
+            return RGBColor(r, g, b)
+
+        with session.lock:
+            prs = session.presentation
+            slide_index = self._validate_slide_index(prs, slide_index)
+            slide = prs.slides[slide_index]
+            shapes = slide.shapes
+            if shape_index >= len(shapes):
+                raise ValueError(f"shape_index {shape_index} 超出范围 (共 {len(shapes)} 个形状)")
+            shape = shapes[shape_index]
+            if not shape.has_table:
+                raise ValueError(f"shape_index {shape_index} 不是表格")
+            table = shape.table
+            num_rows = len(table.rows)
+            num_cols = len(table.columns)
+            if row >= num_rows:
+                raise ValueError(f"row {row} 超出范围 (表格共 {num_rows} 行)")
+            if col >= num_cols:
+                raise ValueError(f"col {col} 超出范围 (表格共 {num_cols} 列)")
+            cell = table.cell(row, col)
+            if text is not None:
+                cell.text = text
+            if fill_color is not None:
+                cell.fill.solid()
+                cell.fill.fore_color.rgb = _parse_color(fill_color)
+            if font_size is not None or bold is not None or alignment is not None:
+                for para in cell.text_frame.paragraphs:
+                    if alignment is not None:
+                        aln_lower = alignment.lower()
+                        if aln_lower not in ALIGNMENT_MAP:
+                            raise ValueError(f"不支持的对齐方式: {alignment!r}")
+                        para.alignment = ALIGNMENT_MAP[aln_lower]
+                    for run in para.runs:
+                        if font_size is not None:
+                            run.font.size = Pt(font_size)
+                        if bold is not None:
+                            run.font.bold = bold
+            session.dirty = True
+            return {
+                "slide_index": slide_index,
+                "shape_index": shape_index,
+                "row": row,
+                "col": col,
+                "message": "表格单元格已格式化",
             }

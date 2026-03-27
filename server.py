@@ -278,6 +278,112 @@ TOOLS = [
             },
             "required": ["session_id", "slide_index"]
         }
+    },
+    {
+        "name": "pptx_add_shape",
+        "description": "在幻灯片上添加自动形状（矩形、椭圆、三角形、箭头等）",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "会话 ID"},
+                "slide_index": {"type": "integer", "minimum": 0, "description": "幻灯片索引（0-based）"},
+                "shape_type": {
+                    "type": "string",
+                    "enum": [
+                        "rectangle", "oval", "triangle", "arrow", "right_arrow", "left_arrow",
+                        "up_arrow", "down_arrow", "pentagon", "hexagon", "star5",
+                        "rounded_rectangle", "cloud", "heart", "lightning_bolt", "diamond",
+                        "parallelogram", "trapezoid", "chevron", "flowchart_process",
+                        "flowchart_decision"
+                    ],
+                    "description": "形状类型"
+                },
+                "left": {"type": "number", "description": "左边距（英寸）"},
+                "top": {"type": "number", "description": "上边距（英寸）"},
+                "width": {"type": "number", "description": "宽度（英寸）"},
+                "height": {"type": "number", "description": "高度（英寸）"},
+                "text": {"type": "string", "description": "形状内的文本（可选）"},
+                "fill_color": {"type": "string", "description": "填充颜色，十六进制如 '#FF5733'（可选）"},
+                "line_color": {"type": "string", "description": "边框颜色，十六进制（可选）"}
+            },
+            "required": ["session_id", "slide_index", "shape_type", "left", "top", "width", "height"]
+        }
+    },
+    {
+        "name": "pptx_add_chart",
+        "description": "在幻灯片上添加图表（柱状图、条形图、折线图、饼图）",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "会话 ID"},
+                "slide_index": {"type": "integer", "minimum": 0, "description": "幻灯片索引（0-based）"},
+                "chart_type": {"type": "string", "enum": ["bar", "column", "line", "pie"], "description": "图表类型"},
+                "categories": {"type": "array", "items": {"type": "string"}, "description": "类别标签列表"},
+                "series_data": {
+                    "type": "array",
+                    "description": "数据系列列表",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "values": {"type": "array", "items": {"type": "number"}}
+                        },
+                        "required": ["name", "values"]
+                    }
+                },
+                "left": {"type": "number", "default": 1, "description": "左边距（英寸）"},
+                "top": {"type": "number", "default": 2, "description": "上边距（英寸）"},
+                "width": {"type": "number", "default": 8, "description": "宽度（英寸）"},
+                "height": {"type": "number", "default": 5, "description": "高度（英寸）"},
+                "title": {"type": "string", "description": "图表标题（可选）"}
+            },
+            "required": ["session_id", "slide_index", "chart_type", "categories", "series_data"]
+        }
+    },
+    {
+        "name": "pptx_manage_text",
+        "description": "统一文本管理：添加文本框（add）、格式化文本（format）、提取文本（extract）",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "会话 ID"},
+                "operation": {"type": "string", "enum": ["add", "format", "extract"], "description": "操作类型"},
+                "slide_index": {"type": "integer", "minimum": 0, "description": "幻灯片索引（extract 全局时可省略）"},
+                "text": {"type": "string", "description": "文本内容（add 模式必填）"},
+                "left": {"type": "number", "default": 1},
+                "top": {"type": "number", "default": 1},
+                "width": {"type": "number", "default": 8},
+                "height": {"type": "number", "default": 1},
+                "font_size": {"type": "integer", "minimum": 1},
+                "font_name": {"type": "string"},
+                "bold": {"type": "boolean"},
+                "italic": {"type": "boolean"},
+                "color": {"type": "string", "description": "文字颜色，十六进制如 '#333333'"},
+                "alignment": {"type": "string", "enum": ["left", "center", "right", "justify"]},
+                "shape_index": {"type": "integer", "minimum": 0, "description": "形状索引（format 模式必填）"}
+            },
+            "required": ["session_id", "operation"]
+        }
+    },
+    {
+        "name": "pptx_format_table_cell",
+        "description": "格式化表格单元格的文本、填充颜色和对齐方式",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "会话 ID"},
+                "slide_index": {"type": "integer", "minimum": 0},
+                "shape_index": {"type": "integer", "minimum": 0, "description": "表格形状索引"},
+                "row": {"type": "integer", "minimum": 0},
+                "col": {"type": "integer", "minimum": 0},
+                "text": {"type": "string"},
+                "font_size": {"type": "integer", "minimum": 1},
+                "bold": {"type": "boolean"},
+                "fill_color": {"type": "string"},
+                "alignment": {"type": "string", "enum": ["left", "center", "right"]}
+            },
+            "required": ["session_id", "slide_index", "shape_index", "row", "col"]
+        }
     }
 ]
 
@@ -581,6 +687,10 @@ class McpHandler(BaseHTTPRequestHandler):
             "pptx_describe_slide": self._tool_describe_slide,
             "pptx_export_slide_snapshot": self._tool_export_slide_snapshot,
             "pptx_get_animation_info": self._tool_get_animation_info,
+            "pptx_add_shape": self._tool_add_shape,
+            "pptx_add_chart": self._tool_add_chart,
+            "pptx_manage_text": self._tool_manage_text,
+            "pptx_format_table_cell": self._tool_format_table_cell,
         }
         
         if tool_name not in handlers:
@@ -717,6 +827,67 @@ class McpHandler(BaseHTTPRequestHandler):
         return self.tools.get_animation_info(
             session_id=args["session_id"],
             slide_index=args["slide_index"]
+        )
+
+    def _tool_add_shape(self, args: dict) -> dict:
+        return self.tools.add_shape(
+            session_id=self._require_arg(args, "session_id"),
+            slide_index=self._require_arg(args, "slide_index"),
+            shape_type=self._require_arg(args, "shape_type"),
+            left=args.get("left", 1.0),
+            top=args.get("top", 1.0),
+            width=args.get("width", 3.0),
+            height=args.get("height", 2.0),
+            text=args.get("text"),
+            fill_color=args.get("fill_color"),
+            line_color=args.get("line_color"),
+        )
+
+    def _tool_add_chart(self, args: dict) -> dict:
+        return self.tools.add_chart(
+            session_id=self._require_arg(args, "session_id"),
+            slide_index=self._require_arg(args, "slide_index"),
+            chart_type=self._require_arg(args, "chart_type"),
+            categories=self._require_arg(args, "categories"),
+            series_data=self._require_arg(args, "series_data"),
+            left=args.get("left", 1.0),
+            top=args.get("top", 2.0),
+            width=args.get("width", 8.0),
+            height=args.get("height", 5.0),
+            title=args.get("title"),
+        )
+
+    def _tool_manage_text(self, args: dict) -> dict:
+        return self.tools.manage_text(
+            session_id=self._require_arg(args, "session_id"),
+            operation=self._require_arg(args, "operation"),
+            slide_index=args.get("slide_index"),
+            text=args.get("text"),
+            left=args.get("left", 1.0),
+            top=args.get("top", 1.0),
+            width=args.get("width", 8.0),
+            height=args.get("height", 1.0),
+            font_size=args.get("font_size"),
+            font_name=args.get("font_name"),
+            bold=args.get("bold"),
+            italic=args.get("italic"),
+            color=args.get("color"),
+            alignment=args.get("alignment"),
+            shape_index=args.get("shape_index"),
+        )
+
+    def _tool_format_table_cell(self, args: dict) -> dict:
+        return self.tools.format_table_cell(
+            session_id=self._require_arg(args, "session_id"),
+            slide_index=self._require_arg(args, "slide_index"),
+            shape_index=self._require_arg(args, "shape_index"),
+            row=self._require_arg(args, "row"),
+            col=self._require_arg(args, "col"),
+            text=args.get("text"),
+            font_size=args.get("font_size"),
+            bold=args.get("bold"),
+            fill_color=args.get("fill_color"),
+            alignment=args.get("alignment"),
         )
 
     def _send_json(self, req_id, result=None, error=None):
