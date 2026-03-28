@@ -1876,3 +1876,506 @@ class PptxTools:
                 "col": col,
                 "message": "表格单元格已格式化",
             }
+
+    # ===== Batch2 新增工具 =====
+
+    def manage_hyperlinks(
+        self,
+        session_id: str,
+        slide_index: int,
+        shape_index: int,
+        operation: str,
+        url: Optional[str] = None,
+        text: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """管理形状中的超链接：添加、移除、列出、更新。
+
+        Args:
+            session_id: 会话 ID
+            slide_index: 幻灯片索引（0-based）
+            shape_index: 形状索引
+            operation: 操作类型（add, remove, list, update）
+            url: 超链接 URL（add/update 时必填）
+            text: 超链接显示文本（add 时可选，指定时创建新 run）
+
+        Returns:
+            操作结果
+        """
+        valid_ops = ("add", "remove", "list", "update")
+        if operation not in valid_ops:
+            raise ValueError(
+                f"无效的 operation: {operation!r}（支持: {', '.join(valid_ops)}）"
+            )
+
+        if operation in ("add", "update") and not url:
+            raise ValueError(f"{operation} 操作需要提供 url 参数")
+
+        if url is not None and not isinstance(url, str):
+            raise TypeError("url 必须是字符串")
+        if text is not None and not isinstance(text, str):
+            raise TypeError("text 必须是字符串")
+
+        if not isinstance(shape_index, int) or isinstance(shape_index, bool):
+            raise TypeError("shape_index 必须是整数")
+
+        session = self.sessions.get(session_id)
+
+        with session.lock:
+            prs = session.presentation
+            slide_index = self._validate_slide_index(prs, slide_index)
+            slide = prs.slides[slide_index]
+
+            if shape_index < 0 or shape_index >= len(slide.shapes):
+                raise ValueError(
+                    f"shape_index {shape_index} 超出范围 (有效范围: 0-{len(slide.shapes) - 1})"
+                )
+
+            shape = slide.shapes[shape_index]
+            if not shape.has_text_frame:
+                raise ValueError(f"shape[{shape_index}] 没有文本框，无法操作超链接")
+
+            text_frame = shape.text_frame
+
+            if operation == "list":
+                hyperlinks = []
+                for para in text_frame.paragraphs:
+                    for run in para.runs:
+                        hl = run.hyperlink
+                        if hl and hl.address:
+                            hyperlinks.append({
+                                "text": run.text,
+                                "url": hl.address,
+                            })
+                return {
+                    "slide_index": slide_index,
+                    "shape_index": shape_index,
+                    "operation": "list",
+                    "hyperlinks": hyperlinks,
+                    "count": len(hyperlinks),
+                    "message": f"找到 {len(hyperlinks)} 个超链接",
+                }
+
+            elif operation == "add":
+                if text:
+                    # 创建新的 paragraph 和 run 携带超链接
+                    p = text_frame.paragraphs[-1] if text_frame.paragraphs else text_frame.add_paragraph()
+                    run = p.add_run()
+                    run.text = text
+                    run.hyperlink.address = url
+                    added_count = 1
+                else:
+                    # 对所有现有 run 添加超链接
+                    added_count = 0
+                    for para in text_frame.paragraphs:
+                        for run in para.runs:
+                            run.hyperlink.address = url
+                            added_count += 1
+
+                session.dirty = True
+                return {
+                    "slide_index": slide_index,
+                    "shape_index": shape_index,
+                    "operation": "add",
+                    "url": url,
+                    "added_count": added_count,
+                    "message": f"已为 {added_count} 个 run 添加超链接",
+                }
+
+            elif operation == "remove":
+                removed_count = 0
+                for para in text_frame.paragraphs:
+                    for run in para.runs:
+                        if run.hyperlink and run.hyperlink.address:
+                            # 通过 lxml 删除超链接关系
+                            r_elem = run._r
+                            rPr = r_elem.find(qn("a:rPr"))
+                            if rPr is not None:
+                                hlinkClick = rPr.find(qn("a:hlinkClick"))
+                                if hlinkClick is not None:
+                                    rPr.remove(hlinkClick)
+                                    removed_count += 1
+
+                session.dirty = True
+                return {
+                    "slide_index": slide_index,
+                    "shape_index": shape_index,
+                    "operation": "remove",
+                    "removed_count": removed_count,
+                    "message": f"已移除 {removed_count} 个超链接",
+                }
+
+            else:  # update
+                updated_count = 0
+                for para in text_frame.paragraphs:
+                    for run in para.runs:
+                        if run.hyperlink and run.hyperlink.address:
+                            run.hyperlink.address = url
+                            updated_count += 1
+
+                session.dirty = True
+                return {
+                    "slide_index": slide_index,
+                    "shape_index": shape_index,
+                    "operation": "update",
+                    "url": url,
+                    "updated_count": updated_count,
+                    "message": f"已更新 {updated_count} 个超链接",
+                }
+
+    # 连接线类型映射（transition_type -> OOXML 元素名）
+    _TRANSITION_TYPE_MAP = {
+        "fade": "fade",
+        "push": "push",
+        "wipe": "wipe",
+        "split": "split",
+        "zoom": "zoom",
+        "fly": "fly",
+        "appear": "cut",      # appear 等效于 cut（无过渡效果时间=0）
+        "dissolve": "dissolve",
+        "cut": "cut",
+        "wheel": "wheel",
+        "strips": "strips",
+        "checker": "checker",
+        "blinds": "blinds",
+        "box": "zoom",        # box 映射为 zoom
+        "random": "random",
+    }
+
+    def add_connector(
+        self,
+        session_id: str,
+        slide_index: int,
+        start_x: float,
+        start_y: float,
+        end_x: float,
+        end_y: float,
+        line_color: Optional[str] = None,
+        line_width: Optional[float] = None,
+        arrow_start: bool = False,
+        arrow_end: bool = True,
+    ) -> Dict[str, Any]:
+        """添加连接线/箭头到幻灯片。
+
+        Args:
+            session_id: 会话 ID
+            slide_index: 幻灯片索引（0-based）
+            start_x: 起点 X 坐标（厘米）
+            start_y: 起点 Y 坐标（厘米）
+            end_x: 终点 X 坐标（厘米）
+            end_y: 终点 Y 坐标（厘米）
+            line_color: 线条颜色十六进制字符串如 'FF0000'（可选）
+            line_width: 线条宽度（磅，可选）
+            arrow_start: 起点是否显示箭头（默认 False）
+            arrow_end: 终点是否显示箭头（默认 True）
+
+        Returns:
+            添加结果
+        """
+        session = self.sessions.get(session_id)
+
+        # 参数校验
+        EMU_PER_CM = 360000
+
+        for name, val in [("start_x", start_x), ("start_y", start_y),
+                          ("end_x", end_x), ("end_y", end_y)]:
+            if not isinstance(val, (int, float)) or isinstance(val, bool):
+                raise TypeError(f"{name} 必须是数字")
+
+        if line_color is not None:
+            parsed_color = self._parse_hex_color(line_color)
+        else:
+            parsed_color = None
+
+        if line_width is not None:
+            if not isinstance(line_width, (int, float)) or isinstance(line_width, bool):
+                raise TypeError("line_width 必须是数字")
+            if line_width <= 0:
+                raise ValueError("line_width 必须大于 0")
+
+        if not isinstance(arrow_start, bool):
+            raise TypeError("arrow_start 必须是布尔值")
+        if not isinstance(arrow_end, bool):
+            raise TypeError("arrow_end 必须是布尔值")
+
+        # 转换坐标为 EMU
+        sx = int(start_x * EMU_PER_CM)
+        sy = int(start_y * EMU_PER_CM)
+        ex = int(end_x * EMU_PER_CM)
+        ey = int(end_y * EMU_PER_CM)
+
+        # 计算连接线的位置和尺寸
+        left = min(sx, ex)
+        top_pos = min(sy, ey)
+        cx = abs(ex - sx)
+        cy = abs(ey - sy)
+
+        # 确保尺寸不为零（至少 1 EMU）
+        if cx == 0:
+            cx = 1
+        if cy == 0:
+            cy = 1
+
+        # 确定是否需要翻转
+        flip_h = "1" if ex < sx else "0"
+        flip_v = "1" if ey < sy else "0"
+
+        with session.lock:
+            prs = session.presentation
+            slide_index = self._validate_slide_index(prs, slide_index)
+            slide = prs.slides[slide_index]
+
+            # 通过 lxml 构建连接线 XML
+            from lxml import etree
+
+            nsmap = {
+                "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+                "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+                "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
+            }
+
+            # 获取唯一的 shape id
+            existing_ids = set()
+            for shape in slide.shapes:
+                try:
+                    existing_ids.add(shape.shape_id)
+                except Exception:
+                    pass
+            new_id = max(existing_ids, default=0) + 1
+
+            # 构建 cxnSp 元素
+            cxnSp = etree.SubElement(
+                slide._element.find(qn("p:cSld")).find(qn("p:spTree")),
+                qn("p:cxnSp"),
+            )
+
+            # nvCxnSpPr
+            nvCxnSpPr = etree.SubElement(cxnSp, qn("p:nvCxnSpPr"))
+            cNvPr = etree.SubElement(nvCxnSpPr, qn("p:cNvPr"))
+            cNvPr.set("id", str(new_id))
+            cNvPr.set("name", f"Connector {new_id}")
+            etree.SubElement(nvCxnSpPr, qn("p:cNvCxnSpPr"))
+            etree.SubElement(nvCxnSpPr, qn("p:nvPr"))
+
+            # spPr
+            spPr = etree.SubElement(cxnSp, qn("p:spPr"))
+
+            # xfrm
+            xfrm = etree.SubElement(spPr, qn("a:xfrm"))
+            if flip_h == "1":
+                xfrm.set("flipH", "1")
+            if flip_v == "1":
+                xfrm.set("flipV", "1")
+
+            off = etree.SubElement(xfrm, qn("a:off"))
+            off.set("x", str(left))
+            off.set("y", str(top_pos))
+            ext = etree.SubElement(xfrm, qn("a:ext"))
+            ext.set("cx", str(cx))
+            ext.set("cy", str(cy))
+
+            # prstGeom - 直线连接器
+            prstGeom = etree.SubElement(spPr, qn("a:prstGeom"))
+            prstGeom.set("prst", "straightConnector1")
+            etree.SubElement(prstGeom, qn("a:avLst"))
+
+            # 线条样式
+            ln = etree.SubElement(spPr, qn("a:ln"))
+            if line_width is not None:
+                ln.set("w", str(int(line_width * 12700)))  # pt to EMU
+
+            if parsed_color is not None:
+                solidFill = etree.SubElement(ln, qn("a:solidFill"))
+                srgbClr = etree.SubElement(solidFill, qn("a:srgbClr"))
+                srgbClr.set("val", str(parsed_color))
+            else:
+                solidFill = etree.SubElement(ln, qn("a:solidFill"))
+                srgbClr = etree.SubElement(solidFill, qn("a:srgbClr"))
+                srgbClr.set("val", "000000")
+
+            # 箭头
+            if arrow_start:
+                headEnd = etree.SubElement(ln, qn("a:headEnd"))
+                headEnd.set("type", "triangle")
+                headEnd.set("w", "med")
+                headEnd.set("len", "med")
+
+            if arrow_end:
+                tailEnd = etree.SubElement(ln, qn("a:tailEnd"))
+                tailEnd.set("type", "triangle")
+                tailEnd.set("w", "med")
+                tailEnd.set("len", "med")
+
+            session.dirty = True
+
+            return {
+                "slide_index": slide_index,
+                "start": {"x_cm": start_x, "y_cm": start_y},
+                "end": {"x_cm": end_x, "y_cm": end_y},
+                "arrow_start": arrow_start,
+                "arrow_end": arrow_end,
+                "message": "连接线已添加",
+            }
+
+    def manage_slide_transitions(
+        self,
+        session_id: str,
+        slide_index: int,
+        transition_type: str,
+        duration: Optional[float] = None,
+        advance_after: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """设置幻灯片过渡效果。
+
+        Args:
+            session_id: 会话 ID
+            slide_index: 幻灯片索引（0-based）
+            transition_type: 过渡类型（fade, push, wipe, split, zoom 等）
+            duration: 过渡持续时间（秒，可选）
+            advance_after: 自动切换时间（秒，可选）
+
+        Returns:
+            设置结果
+        """
+        session = self.sessions.get(session_id)
+
+        # 参数校验
+        tt_lower = transition_type.strip().lower() if isinstance(transition_type, str) else ""
+        if tt_lower not in self._TRANSITION_TYPE_MAP:
+            supported = ", ".join(sorted(self._TRANSITION_TYPE_MAP.keys()))
+            raise ValueError(
+                f"不支持的 transition_type: {transition_type!r}（支持: {supported}）"
+            )
+
+        if duration is not None:
+            if not isinstance(duration, (int, float)) or isinstance(duration, bool):
+                raise TypeError("duration 必须是数字")
+            if duration < 0:
+                raise ValueError("duration 不能为负数")
+
+        if advance_after is not None:
+            if not isinstance(advance_after, (int, float)) or isinstance(advance_after, bool):
+                raise TypeError("advance_after 必须是数字")
+            if advance_after < 0:
+                raise ValueError("advance_after 不能为负数")
+
+        ooxml_type = self._TRANSITION_TYPE_MAP[tt_lower]
+
+        with session.lock:
+            prs = session.presentation
+            slide_index = self._validate_slide_index(prs, slide_index)
+            slide = prs.slides[slide_index]
+
+            se = slide._element
+            PML = "http://schemas.openxmlformats.org/presentationml/2006/main"
+
+            # 移除旧的 transition 节点
+            old_trans = se.find(f"{{{PML}}}transition")
+            if old_trans is not None:
+                se.remove(old_trans)
+
+            # 创建新的 transition 节点
+            from lxml import etree
+
+            trans = etree.SubElement(se, qn("p:transition"))
+
+            # 设置过渡持续时间（毫秒）
+            if duration is not None:
+                trans.set("spd", "med")  # 默认中速
+                dur_ms = str(int(duration * 1000))
+                trans.set("dur", dur_ms)
+
+            # 设置自动切换时间
+            if advance_after is not None:
+                adv_ms = str(int(advance_after * 1000))
+                trans.set("advTm", adv_ms)
+                trans.set("advClick", "true")
+
+            # 添加过渡类型子元素
+            etree.SubElement(trans, qn(f"p:{ooxml_type}"))
+
+            session.dirty = True
+
+            return {
+                "slide_index": slide_index,
+                "transition_type": tt_lower,
+                "ooxml_element": ooxml_type,
+                "duration_seconds": duration,
+                "advance_after_seconds": advance_after,
+                "message": "幻灯片过渡效果已设置",
+            }
+
+    def set_core_properties(
+        self,
+        session_id: str,
+        title: Optional[str] = None,
+        subject: Optional[str] = None,
+        author: Optional[str] = None,
+        keywords: Optional[str] = None,
+        comments: Optional[str] = None,
+        category: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """设置文档核心属性。
+
+        Args:
+            session_id: 会话 ID
+            title: 文档标题（可选）
+            subject: 文档主题（可选）
+            author: 作者（可选）
+            keywords: 关键词（可选）
+            comments: 备注（可选）
+            category: 分类（可选）
+
+        Returns:
+            设置结果
+        """
+        session = self.sessions.get(session_id)
+
+        # 参数校验
+        fields = {
+            "title": title,
+            "subject": subject,
+            "author": author,
+            "keywords": keywords,
+            "comments": comments,
+            "category": category,
+        }
+
+        for name, val in fields.items():
+            if val is not None and not isinstance(val, str):
+                raise TypeError(f"{name} 必须是字符串")
+
+        # 检查是否至少传入了一个参数
+        if all(v is None for v in fields.values()):
+            raise ValueError("至少需要设置一个属性（title, subject, author, keywords, comments, category）")
+
+        with session.lock:
+            prs = session.presentation
+            props = prs.core_properties
+
+            updated = {}
+            if title is not None:
+                props.title = title
+                updated["title"] = title
+            if subject is not None:
+                props.subject = subject
+                updated["subject"] = subject
+            if author is not None:
+                props.author = author
+                updated["author"] = author
+            if keywords is not None:
+                props.keywords = keywords
+                updated["keywords"] = keywords
+            if comments is not None:
+                props.comments = comments
+                updated["comments"] = comments
+            if category is not None:
+                props.category = category
+                updated["category"] = category
+
+            session.dirty = True
+
+            return {
+                "updated_fields": updated,
+                "field_count": len(updated),
+                "message": f"已更新 {len(updated)} 个文档属性",
+            }
