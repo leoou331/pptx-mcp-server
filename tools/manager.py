@@ -1912,6 +1912,10 @@ class PptxTools:
 
         if url is not None and not isinstance(url, str):
             raise TypeError("url 必须是字符串")
+        if url is not None:
+            _ALLOWED_SCHEMES = ("http://", "https://", "ftp://", "mailto:")
+            if not any(url.lower().startswith(s) for s in _ALLOWED_SCHEMES):
+                raise ValueError("URL 协议不受支持，请使用 http/https/ftp/mailto")
         if text is not None and not isinstance(text, str):
             raise TypeError("text 必须是字符串")
 
@@ -2029,7 +2033,7 @@ class PptxTools:
         "wipe": "wipe",
         "split": "split",
         "zoom": "zoom",
-        "fly": "fly",
+        "fly": "cover",
         "appear": "cut",      # appear 等效于 cut（无过渡效果时间=0）
         "dissolve": "dissolve",
         "cut": "cut",
@@ -2081,6 +2085,12 @@ class PptxTools:
             if not isinstance(val, (int, float)) or isinstance(val, bool):
                 raise TypeError(f"{name} 必须是数字")
 
+        # 范围校验：坐标不能为负数
+        start_x = self._validate_non_negative(start_x, "start_x")
+        start_y = self._validate_non_negative(start_y, "start_y")
+        end_x = self._validate_non_negative(end_x, "end_x")
+        end_y = self._validate_non_negative(end_y, "end_y")
+
         if line_color is not None:
             parsed_color = self._parse_hex_color(line_color)
         else:
@@ -2126,12 +2136,6 @@ class PptxTools:
 
             # 通过 lxml 构建连接线 XML
             from lxml import etree
-
-            nsmap = {
-                "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
-                "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
-                "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
-            }
 
             # 获取唯一的 shape id
             existing_ids = set()
@@ -2273,10 +2277,18 @@ class PptxTools:
             if old_trans is not None:
                 se.remove(old_trans)
 
-            # 创建新的 transition 节点
+            # 创建新的 transition 节点（必须在 timing/extLst 之前）
             from lxml import etree
 
-            trans = etree.SubElement(se, qn("p:transition"))
+            trans = etree.Element(qn("p:transition"))
+            timing_el = se.find(qn('p:timing'))
+            extlst_el = se.find(qn('p:extLst'))
+            insert_before = timing_el if timing_el is not None else extlst_el
+            if insert_before is not None:
+                idx = list(se).index(insert_before)
+                se.insert(idx, trans)
+            else:
+                se.append(trans)
 
             # 设置过渡持续时间（毫秒）
             if duration is not None:
