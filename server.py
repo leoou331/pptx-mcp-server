@@ -380,6 +380,82 @@ TOOLS = [
             },
             "required": ["session_id", "slide_index", "shape_index", "row", "col"]
         }
+    },
+    {
+        "name": "pptx_manage_hyperlinks",
+        "description": "管理形状中的超链接（添加、移除、列出、更新）",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "会话 ID"},
+                "slide_index": {"type": "integer", "minimum": 0, "description": "幻灯片索引（0-based）"},
+                "shape_index": {"type": "integer", "minimum": 0, "description": "形状索引"},
+                "operation": {
+                    "type": "string",
+                    "enum": ["add", "remove", "list", "update"],
+                    "description": "操作类型"
+                },
+                "url": {"type": "string", "description": "超链接 URL（add/update 时必填）"},
+                "text": {"type": "string", "description": "超链接显示文本（add 时可选，指定时创建新 run）"}
+            },
+            "required": ["session_id", "slide_index", "shape_index", "operation"]
+        }
+    },
+    {
+        "name": "pptx_add_connector",
+        "description": "添加连接线/箭头到幻灯片（坐标单位：厘米）",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "会话 ID"},
+                "slide_index": {"type": "integer", "minimum": 0, "description": "幻灯片索引（0-based）"},
+                "start_x": {"type": "number", "description": "起点 X 坐标（厘米）"},
+                "start_y": {"type": "number", "description": "起点 Y 坐标（厘米）"},
+                "end_x": {"type": "number", "description": "终点 X 坐标（厘米）"},
+                "end_y": {"type": "number", "description": "终点 Y 坐标（厘米）"},
+                "line_color": {"type": "string", "description": "线条颜色十六进制如 FF0000（可选）"},
+                "line_width": {"type": "number", "description": "线条宽度（磅，可选）"},
+                "arrow_start": {"type": "boolean", "default": False, "description": "起点是否显示箭头"},
+                "arrow_end": {"type": "boolean", "default": True, "description": "终点是否显示箭头"}
+            },
+            "required": ["session_id", "slide_index", "start_x", "start_y", "end_x", "end_y"]
+        }
+    },
+    {
+        "name": "pptx_manage_slide_transitions",
+        "description": "设置幻灯片过渡效果（fade, push, wipe, split, zoom 等）",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "会话 ID"},
+                "slide_index": {"type": "integer", "minimum": 0, "description": "幻灯片索引（0-based）"},
+                "transition_type": {
+                    "type": "string",
+                    "enum": ["fade", "push", "wipe", "split", "zoom", "fly", "appear", "dissolve", "cut", "wheel", "strips", "checker", "blinds", "box", "random"],
+                    "description": "过渡效果类型"
+                },
+                "duration": {"type": "number", "description": "过渡持续时间（秒，可选）"},
+                "advance_after": {"type": "number", "description": "自动切换时间（秒，可选）"}
+            },
+            "required": ["session_id", "slide_index", "transition_type"]
+        }
+    },
+    {
+        "name": "pptx_set_core_properties",
+        "description": "设置文档核心属性（标题、主题、作者、关键词、备注、分类）",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "会话 ID"},
+                "title": {"type": "string", "description": "文档标题（可选）"},
+                "subject": {"type": "string", "description": "文档主题（可选）"},
+                "author": {"type": "string", "description": "作者（可选）"},
+                "keywords": {"type": "string", "description": "关键词（可选）"},
+                "comments": {"type": "string", "description": "备注（可选）"},
+                "category": {"type": "string", "description": "分类（可选）"}
+            },
+            "required": ["session_id"]
+        }
     }
 ]
 
@@ -687,6 +763,10 @@ class McpHandler(BaseHTTPRequestHandler):
             "pptx_add_chart": self._tool_add_chart,
             "pptx_manage_text": self._tool_manage_text,
             "pptx_format_table_cell": self._tool_format_table_cell,
+            "pptx_manage_hyperlinks": self._tool_manage_hyperlinks,
+            "pptx_add_connector": self._tool_add_connector,
+            "pptx_manage_slide_transitions": self._tool_manage_slide_transitions,
+            "pptx_set_core_properties": self._tool_set_core_properties,
         }
         
         if tool_name not in handlers:
@@ -884,6 +964,50 @@ class McpHandler(BaseHTTPRequestHandler):
             bold=args.get("bold"),
             fill_color=args.get("fill_color"),
             alignment=args.get("alignment"),
+        )
+
+    def _tool_manage_hyperlinks(self, args: dict) -> dict:
+        return self.tools.manage_hyperlinks(
+            session_id=self._require_arg(args, "session_id"),
+            slide_index=self._require_arg(args, "slide_index"),
+            shape_index=self._require_arg(args, "shape_index"),
+            operation=self._require_arg(args, "operation"),
+            url=args.get("url"),
+            text=args.get("text"),
+        )
+
+    def _tool_add_connector(self, args: dict) -> dict:
+        return self.tools.add_connector(
+            session_id=self._require_arg(args, "session_id"),
+            slide_index=self._require_arg(args, "slide_index"),
+            start_x=self._require_arg(args, "start_x"),
+            start_y=self._require_arg(args, "start_y"),
+            end_x=self._require_arg(args, "end_x"),
+            end_y=self._require_arg(args, "end_y"),
+            line_color=args.get("line_color"),
+            line_width=args.get("line_width"),
+            arrow_start=args.get("arrow_start", False),
+            arrow_end=args.get("arrow_end", True),
+        )
+
+    def _tool_manage_slide_transitions(self, args: dict) -> dict:
+        return self.tools.manage_slide_transitions(
+            session_id=self._require_arg(args, "session_id"),
+            slide_index=self._require_arg(args, "slide_index"),
+            transition_type=self._require_arg(args, "transition_type"),
+            duration=args.get("duration"),
+            advance_after=args.get("advance_after"),
+        )
+
+    def _tool_set_core_properties(self, args: dict) -> dict:
+        return self.tools.set_core_properties(
+            session_id=self._require_arg(args, "session_id"),
+            title=args.get("title"),
+            subject=args.get("subject"),
+            author=args.get("author"),
+            keywords=args.get("keywords"),
+            comments=args.get("comments"),
+            category=args.get("category"),
         )
 
     def _send_json(self, req_id, result=None, error=None):
