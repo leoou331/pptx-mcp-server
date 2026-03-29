@@ -456,6 +456,76 @@ TOOLS = [
             },
             "required": ["session_id"]
         }
+    },
+    {
+        "name": "pptx_manage_slide_masters",
+        "description": "管理幻灯片母版和版式：列出所有母版/版式、为指定幻灯片应用版式",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "会话 ID"},
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "apply"],
+                    "description": "操作类型：list（列出所有母版/版式）、apply（应用版式）"
+                },
+                "slide_index": {"type": "integer", "minimum": 0, "description": "目标幻灯片索引（0-based），apply 时必填"},
+                "master_index": {"type": "integer", "minimum": 0, "default": 0, "description": "母版索引（0-based），默认 0"},
+                "layout_index": {"type": "integer", "minimum": 0, "description": "版式索引（0-based），apply 时必填"}
+            },
+            "required": ["session_id", "action"]
+        }
+    },
+    {
+        "name": "pptx_apply_picture_effects",
+        "description": "对幻灯片中的图片应用视觉效果（裁剪、边框、阴影、透明度、亮度、对比度）",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "会话 ID"},
+                "slide_index": {"type": "integer", "minimum": 0, "description": "幻灯片索引（0-based）"},
+                "shape_index": {"type": "integer", "minimum": 0, "description": "图片索引（在该幻灯片所有图片中，0-based）"},
+                "effects": {
+                    "type": "object",
+                    "description": "效果配置对象，支持 crop（裁剪）、border（边框）、shadow（阴影）、transparency（透明度）、brightness（亮度）、contrast（对比度）",
+                    "properties": {
+                        "crop": {
+                            "type": "object",
+                            "description": "裁剪设置",
+                            "properties": {
+                                "left": {"type": "number", "minimum": 0, "maximum": 1, "description": "左裁剪比例 0.0~1.0"},
+                                "top": {"type": "number", "minimum": 0, "maximum": 1, "description": "上裁剪比例 0.0~1.0"},
+                                "right": {"type": "number", "minimum": 0, "maximum": 1, "description": "右裁剪比例 0.0~1.0"},
+                                "bottom": {"type": "number", "minimum": 0, "maximum": 1, "description": "下裁剪比例 0.0~1.0"}
+                            }
+                        },
+                        "border": {
+                            "type": "object",
+                            "description": "边框设置",
+                            "properties": {
+                                "color": {"type": "string", "description": "颜色十六进制如 FF0000"},
+                                "width": {"type": "number", "description": "宽度（磅）"}
+                            }
+                        },
+                        "shadow": {
+                            "type": "object",
+                            "description": "阴影设置",
+                            "properties": {
+                                "type": {"type": "string", "enum": ["outer", "inner", "perspective"], "description": "阴影类型"},
+                                "blur_radius": {"type": "number", "description": "模糊半径（磅）"},
+                                "distance": {"type": "number", "description": "阴影距离（磅）"},
+                                "angle": {"type": "number", "description": "角度（度）"},
+                                "color": {"type": "string", "description": "颜色十六进制如 000000"}
+                            }
+                        },
+                        "transparency": {"type": "number", "minimum": 0, "maximum": 1, "description": "透明度 0.0~1.0"},
+                        "brightness": {"type": "number", "minimum": -1, "maximum": 1, "description": "亮度 -1.0~1.0"},
+                        "contrast": {"type": "number", "minimum": -1, "maximum": 1, "description": "对比度 -1.0~1.0"}
+                    }
+                }
+            },
+            "required": ["session_id", "slide_index", "shape_index", "effects"]
+        }
     }
 ]
 
@@ -767,6 +837,8 @@ class McpHandler(BaseHTTPRequestHandler):
             "pptx_add_connector": self._tool_add_connector,
             "pptx_manage_slide_transitions": self._tool_manage_slide_transitions,
             "pptx_set_core_properties": self._tool_set_core_properties,
+            "pptx_manage_slide_masters": self._tool_manage_slide_masters,
+            "pptx_apply_picture_effects": self._tool_apply_picture_effects,
         }
         
         if tool_name not in handlers:
@@ -1008,6 +1080,23 @@ class McpHandler(BaseHTTPRequestHandler):
             keywords=args.get("keywords"),
             comments=args.get("comments"),
             category=args.get("category"),
+        )
+
+    def _tool_manage_slide_masters(self, args: dict) -> dict:
+        return self.tools.manage_slide_masters(
+            session_id=self._require_arg(args, "session_id"),
+            action=self._require_arg(args, "action"),
+            slide_index=args.get("slide_index"),
+            master_index=args.get("master_index", 0),
+            layout_index=args.get("layout_index"),
+        )
+
+    def _tool_apply_picture_effects(self, args: dict) -> dict:
+        return self.tools.apply_picture_effects(
+            session_id=self._require_arg(args, "session_id"),
+            slide_index=self._require_arg(args, "slide_index"),
+            shape_index=self._require_arg(args, "shape_index"),
+            effects=self._require_arg(args, "effects"),
         )
 
     def _send_json(self, req_id, result=None, error=None):

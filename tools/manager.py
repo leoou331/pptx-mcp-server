@@ -2391,3 +2391,436 @@ class PptxTools:
                 "field_count": len(updated),
                 "message": f"已更新 {len(updated)} 个文档属性",
             }
+
+    # ===== Batch3 新增工具 =====
+
+    def manage_slide_masters(
+        self,
+        session_id: str,
+        action: str,
+        slide_index: Optional[int] = None,
+        master_index: int = 0,
+        layout_index: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """管理幻灯片母版和版式。
+
+        Args:
+            session_id: 会话 ID
+            action: 操作类型（"list" 或 "apply"）
+            slide_index: 目标幻灯片索引（0-based），apply 时必填
+            master_index: 母版索引（0-based），默认 0
+            layout_index: 版式索引（0-based），apply 时必填
+
+        Returns:
+            操作结果
+        """
+        if action not in ("list", "apply"):
+            raise ValueError(f"无效的 action: {action!r}（支持: list, apply）")
+
+        if not isinstance(master_index, int) or isinstance(master_index, bool):
+            raise TypeError("master_index 必须是整数")
+        if master_index < 0:
+            raise ValueError("master_index 不能为负数")
+
+        if action == "apply":
+            if slide_index is None:
+                raise ValueError("apply 操作需要 slide_index 参数")
+            if layout_index is None:
+                raise ValueError("apply 操作需要 layout_index 参数")
+            if not isinstance(layout_index, int) or isinstance(layout_index, bool):
+                raise TypeError("layout_index 必须是整数")
+            if layout_index < 0:
+                raise ValueError("layout_index 不能为负数")
+
+        session = self.sessions.get(session_id)
+
+        with session.lock:
+            prs = session.presentation
+
+            # 验证 master_index
+            masters = list(prs.slide_masters)
+            if master_index >= len(masters):
+                raise ValueError(
+                    f"master_index {master_index} 超出范围 (有效范围: 0-{len(masters) - 1})"
+                )
+
+            if action == "list":
+                masters_info = []
+                for m_idx, master in enumerate(masters):
+                    layouts_info = []
+                    for l_idx, layout in enumerate(master.slide_layouts):
+                        layouts_info.append({
+                            "index": l_idx,
+                            "name": layout.name,
+                        })
+                    masters_info.append({
+                        "index": m_idx,
+                        "name": getattr(master, "name", f"Master {m_idx}"),
+                        "layout_count": len(master.slide_layouts),
+                        "layouts": layouts_info,
+                    })
+
+                return {
+                    "action": "list",
+                    "total_masters": len(masters),
+                    "masters": masters_info,
+                    "message": f"找到 {len(masters)} 个母版",
+                }
+
+            else:  # apply
+                slide_index = self._validate_slide_index(prs, slide_index)
+                slide = prs.slides[slide_index]
+                master = masters[master_index]
+
+                layouts = list(master.slide_layouts)
+                if layout_index >= len(layouts):
+                    raise ValueError(
+                        f"layout_index {layout_index} 超出范围 "
+                        f"(母版 {master_index} 有效范围: 0-{len(layouts) - 1})"
+                    )
+
+                target_layout = layouts[layout_index]
+
+                # 通过 XML 操作修改幻灯片的版式引用
+                # python-pptx 不直接支持 slide.slide_layout = layout 赋值，
+                # 需要通过修改幻灯片 XML 中的 rId 引用来实现
+                from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+
+                # 获取幻灯片的 part
+                slide_part = slide.part
+
+                # 移除旧的 slideLayout 关系
+                old_layout_rel = None
+                for rel in slide_part.rels.values():
+                    if rel.reltype == RT.SLIDE_LAYOUT:
+                        old_layout_rel = rel
+                        break
+
+                if old_layout_rel is not None:
+                    old_rId = old_layout_rel.rId
+                    # 删除旧关系（使用 pop 方法）
+                    slide_part.rels.pop(old_rId)
+
+                # 添加新的 slideLayout 关系
+                new_rId = slide_part.rels.get_or_add(
+                    RT.SLIDE_LAYOUT, target_layout.part
+                )
+
+                session.dirty = True
+
+                return {
+                    "action": "apply",
+                    "slide_index": slide_index,
+                    "master_index": master_index,
+                    "layout_index": layout_index,
+                    "layout_name": target_layout.name,
+                    "message": f"已将幻灯片 {slide_index} 的版式更改为 '{target_layout.name}'",
+                }
+
+    def apply_picture_effects(
+        self,
+        session_id: str,
+        slide_index: int,
+        shape_index: int,
+        effects: dict,
+    ) -> Dict[str, Any]:
+        """对幻灯片中的图片应用视觉效果。
+
+        Args:
+            session_id: 会话 ID
+            slide_index: 幻灯片索引（0-based）
+            shape_index: 图片形状索引（0-based，在该幻灯片所有图片中）
+            effects: 效果配置，可包含 crop, border, shadow, transparency,
+                     brightness, contrast
+
+        Returns:
+            操作结果
+        """
+        if not isinstance(effects, dict):
+            raise TypeError("effects 必须是字典")
+        if not effects:
+            raise ValueError("effects 不能为空")
+        if not isinstance(shape_index, int) or isinstance(shape_index, bool):
+            raise TypeError("shape_index 必须是整数")
+        if shape_index < 0:
+            raise ValueError("shape_index 不能为负数")
+
+        VALID_EFFECTS = {"crop", "border", "shadow", "transparency", "brightness", "contrast"}
+        unknown = set(effects.keys()) - VALID_EFFECTS
+        if unknown:
+            raise ValueError(f"不支持的效果类型: {unknown}（支持: {', '.join(sorted(VALID_EFFECTS))}）")
+
+        # 预验证 effects 参数（锁外）
+        if "crop" in effects:
+            crop = effects["crop"]
+            if not isinstance(crop, dict):
+                raise TypeError("crop 必须是字典")
+            for key in ("left", "top", "right", "bottom"):
+                if key in crop:
+                    val = crop[key]
+                    if not isinstance(val, (int, float)) or isinstance(val, bool):
+                        raise TypeError(f"crop.{key} 必须是数字")
+                    if val < 0.0 or val > 1.0:
+                        raise ValueError(f"crop.{key} 必须在 0.0~1.0 之间，收到 {val}")
+
+        if "border" in effects:
+            border = effects["border"]
+            if not isinstance(border, dict):
+                raise TypeError("border 必须是字典")
+            if "color" in border:
+                self._parse_hex_color(border["color"])
+            if "width" in border:
+                w = border["width"]
+                if not isinstance(w, (int, float)) or isinstance(w, bool):
+                    raise TypeError("border.width 必须是数字")
+                if w <= 0:
+                    raise ValueError("border.width 必须大于 0")
+
+        if "shadow" in effects:
+            shadow = effects["shadow"]
+            if not isinstance(shadow, dict):
+                raise TypeError("shadow 必须是字典")
+            valid_shadow_types = ("outer", "inner", "perspective")
+            stype = shadow.get("type", "outer")
+            if stype not in valid_shadow_types:
+                raise ValueError(
+                    f"shadow.type 无效: {stype!r}（支持: {', '.join(valid_shadow_types)}）"
+                )
+            if "blur_radius" in shadow:
+                v = shadow["blur_radius"]
+                if not isinstance(v, (int, float)) or isinstance(v, bool):
+                    raise TypeError("shadow.blur_radius 必须是数字")
+                if v < 0:
+                    raise ValueError("shadow.blur_radius 不能为负数")
+            if "distance" in shadow:
+                v = shadow["distance"]
+                if not isinstance(v, (int, float)) or isinstance(v, bool):
+                    raise TypeError("shadow.distance 必须是数字")
+                if v < 0:
+                    raise ValueError("shadow.distance 不能为负数")
+            if "angle" in shadow:
+                v = shadow["angle"]
+                if not isinstance(v, (int, float)) or isinstance(v, bool):
+                    raise TypeError("shadow.angle 必须是数字")
+            if "color" in shadow:
+                self._parse_hex_color(shadow["color"])
+
+        if "transparency" in effects:
+            val = effects["transparency"]
+            if not isinstance(val, (int, float)) or isinstance(val, bool):
+                raise TypeError("transparency 必须是数字")
+            if val < 0.0 or val > 1.0:
+                raise ValueError(f"transparency 必须在 0.0~1.0 之间，收到 {val}")
+
+        if "brightness" in effects:
+            val = effects["brightness"]
+            if not isinstance(val, (int, float)) or isinstance(val, bool):
+                raise TypeError("brightness 必须是数字")
+            if val < -1.0 or val > 1.0:
+                raise ValueError(f"brightness 必须在 -1.0~1.0 之间，收到 {val}")
+
+        if "contrast" in effects:
+            val = effects["contrast"]
+            if not isinstance(val, (int, float)) or isinstance(val, bool):
+                raise TypeError("contrast 必须是数字")
+            if val < -1.0 or val > 1.0:
+                raise ValueError(f"contrast 必须在 -1.0~1.0 之间，收到 {val}")
+
+        session = self.sessions.get(session_id)
+
+        with session.lock:
+            prs = session.presentation
+            slide_index = self._validate_slide_index(prs, slide_index)
+            slide = prs.slides[slide_index]
+
+            # 收集该幻灯片上所有的图片形状
+            pictures = []
+            for shape in slide.shapes:
+                if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                    pictures.append(shape)
+
+            if not pictures:
+                raise ValueError(f"幻灯片 {slide_index} 上没有图片形状")
+
+            if shape_index >= len(pictures):
+                raise ValueError(
+                    f"shape_index {shape_index} 超出范围 "
+                    f"(幻灯片 {slide_index} 有 {len(pictures)} 张图片，有效范围: 0-{len(pictures) - 1})"
+                )
+
+            picture = pictures[shape_index]
+            applied = []
+
+            # 1. 裁剪
+            if "crop" in effects:
+                crop = effects["crop"]
+                if "left" in crop:
+                    picture.crop_left = crop["left"]
+                if "top" in crop:
+                    picture.crop_top = crop["top"]
+                if "right" in crop:
+                    picture.crop_right = crop["right"]
+                if "bottom" in crop:
+                    picture.crop_bottom = crop["bottom"]
+                applied.append("crop")
+
+            # 2. 边框
+            if "border" in effects:
+                border = effects["border"]
+                if "color" in border:
+                    picture.line.color.rgb = self._parse_hex_color(border["color"])
+                if "width" in border:
+                    picture.line.width = Pt(border["width"])
+                applied.append("border")
+
+            # 3. 阴影（通过 XML 操作 effectLst）
+            if "shadow" in effects:
+                shadow = effects["shadow"]
+                self._apply_shadow_effect(picture, shadow)
+                applied.append("shadow")
+
+            # 4. 透明度（通过 XML 操作 blipFill 的 alphaModFix）
+            if "transparency" in effects:
+                self._apply_transparency_effect(picture, effects["transparency"])
+                applied.append("transparency")
+
+            # 5. 亮度（通过 XML 操作 blip 的 lum 效果）
+            if "brightness" in effects:
+                self._apply_brightness_effect(picture, effects["brightness"])
+                applied.append("brightness")
+
+            # 6. 对比度（通过 XML 操作 blip 的对比度效果）
+            if "contrast" in effects:
+                self._apply_contrast_effect(picture, effects["contrast"])
+                applied.append("contrast")
+
+            session.dirty = True
+
+            return {
+                "slide_index": slide_index,
+                "shape_index": shape_index,
+                "shape_name": picture.name,
+                "applied_effects": applied,
+                "effect_count": len(applied),
+                "message": f"已对图片 '{picture.name}' 应用 {len(applied)} 个效果",
+            }
+
+    def _apply_shadow_effect(self, picture, shadow: dict) -> None:
+        """通过 XML 操作为形状添加阴影效果。"""
+        from lxml import etree
+
+        spPr = picture._element.find(qn("p:spPr"))
+        if spPr is None:
+            spPr = picture._element.find(qn("pic:spPr"))
+        if spPr is None:
+            # 尝试直接从 pic 元素获取
+            spPr = picture._element.spPr
+
+        # 移除现有的 effectLst
+        old_effectLst = spPr.find(qn("a:effectLst"))
+        if old_effectLst is not None:
+            spPr.remove(old_effectLst)
+
+        effectLst = etree.SubElement(spPr, qn("a:effectLst"))
+
+        stype = shadow.get("type", "outer")
+        blur_radius = shadow.get("blur_radius", 4.0)
+        distance = shadow.get("distance", 3.0)
+        angle = shadow.get("angle", 315)
+        color_hex = shadow.get("color", "000000")
+
+        # EMU 转换: pt * 12700
+        blur_emu = int(blur_radius * 12700)
+        dist_emu = int(distance * 12700)
+        # OOXML 角度: degrees * 60000
+        angle_val = int(angle * 60000)
+
+        if stype == "outer":
+            shadow_elem = etree.SubElement(effectLst, qn("a:outerShdw"))
+        elif stype == "inner":
+            shadow_elem = etree.SubElement(effectLst, qn("a:innerShdw"))
+        else:  # perspective
+            shadow_elem = etree.SubElement(effectLst, qn("a:outerShdw"))
+
+        shadow_elem.set("blurRad", str(blur_emu))
+        shadow_elem.set("dist", str(dist_emu))
+        shadow_elem.set("dir", str(angle_val))
+        if stype != "inner":
+            shadow_elem.set("rotWithShape", "0")
+
+        # 颜色
+        srgbClr = etree.SubElement(shadow_elem, qn("a:srgbClr"))
+        cleaned = color_hex.strip().lstrip("#")
+        srgbClr.set("val", cleaned)
+
+    def _apply_transparency_effect(self, picture, transparency: float) -> None:
+        """通过修改 blip 的 alphaModFix 设置图片透明度。"""
+        from lxml import etree
+
+        # 找到 blip 元素
+        blipFill = picture._element.find(qn("p:blipFill"))
+        if blipFill is None:
+            blipFill = picture._element.find(qn("pic:blipFill"))
+        if blipFill is None:
+            return
+
+        blip = blipFill.find(qn("a:blip"))
+        if blip is None:
+            return
+
+        # 移除旧的 alphaModFix
+        for old in blip.findall(qn("a:alphaModFix")):
+            blip.remove(old)
+
+        if transparency > 0:
+            # alphaModFix amt: (1 - transparency) * 100000
+            amt = int((1.0 - transparency) * 100000)
+            alpha_mod = etree.SubElement(blip, qn("a:alphaModFix"))
+            alpha_mod.set("amt", str(amt))
+
+    def _apply_brightness_effect(self, picture, brightness: float) -> None:
+        """通过修改 blip 的 lum 效果设置亮度。"""
+        from lxml import etree
+
+        blipFill = picture._element.find(qn("p:blipFill"))
+        if blipFill is None:
+            blipFill = picture._element.find(qn("pic:blipFill"))
+        if blipFill is None:
+            return
+
+        blip = blipFill.find(qn("a:blip"))
+        if blip is None:
+            return
+
+        # 移除旧的 lum 效果
+        for old in blip.findall(qn("a:lum")):
+            blip.remove(old)
+
+        if brightness != 0:
+            # bright: 百分比值 * 100000（如 0.5 → 50000）
+            bright_val = int(brightness * 100000)
+            lum = etree.SubElement(blip, qn("a:lum"))
+            lum.set("bright", str(bright_val))
+
+    def _apply_contrast_effect(self, picture, contrast: float) -> None:
+        """通过修改 blip 的 lum 效果设置对比度。"""
+        from lxml import etree
+
+        blipFill = picture._element.find(qn("p:blipFill"))
+        if blipFill is None:
+            blipFill = picture._element.find(qn("pic:blipFill"))
+        if blipFill is None:
+            return
+
+        blip = blipFill.find(qn("a:blip"))
+        if blip is None:
+            return
+
+        # 查找现有的 lum 元素（可能已在 brightness 中创建）
+        lum = blip.find(qn("a:lum"))
+        if lum is None:
+            lum = etree.SubElement(blip, qn("a:lum"))
+
+        # contrast: 百分比值 * 100000（如 0.5 → 50000）
+        contrast_val = int(contrast * 100000)
+        lum.set("contrast", str(contrast_val))
