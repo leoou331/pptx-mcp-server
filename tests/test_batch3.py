@@ -216,12 +216,17 @@ class TestManageSlideMasters:
         # idx 0 (title) 和 idx 1 (subtitle) 应被移除
         assert 0 not in remaining_ph_idxs, "Title placeholder (idx=0) should be removed"
         assert 1 not in remaining_ph_idxs, "Subtitle placeholder (idx=1) should be removed"
-        # 共有的 placeholder (10, 11, 12) 应被保留
-        for idx in blank_ph_idxs:
-            if idx in initial_ph_idxs:
-                assert idx in remaining_ph_idxs, (
-                    f"Placeholder idx={idx} exists in both layouts and should be kept"
-                )
+        # blank_ph_idxs 与 initial_ph_idxs 没有交集（Blank layout 没有 title/subtitle），
+        # 所以不会有"共有 placeholder 被保留"的场景。
+        # 直接验证 blank layout 和初始 layout 确实没有交集，以明确测试前提。
+        common_idxs = blank_ph_idxs & initial_ph_idxs
+        assert len(common_idxs) == 0, (
+            f"Test assumes no common placeholders, but found {common_idxs}"
+        )
+        # 验证返回值包含被移除的 placeholder 信息
+        assert "removed_placeholder_idxs" in result
+        assert 0 in result["removed_placeholder_idxs"]
+        assert 1 in result["removed_placeholder_idxs"]
 
     def test_apply_keeps_matching_placeholders(self, tools_env):
         """切换版式时，新版式中也有的 placeholder idx 应保留。"""
@@ -262,6 +267,14 @@ class TestManageSlideMasters:
             f"Remaining placeholders {remaining_ph_idxs} should be subset "
             f"of new layout placeholders {layout_1_ph_idxs}"
         )
+        # 验证 title placeholder (idx=0) 没有被移除
+        assert 0 in remaining_ph_idxs, "title placeholder (idx=0) should be kept"
+        assert 0 not in result.get("removed_placeholder_idxs", []), (
+            "title placeholder (idx=0) should not be in removed list"
+        )
+        # 验证返回值包含新字段
+        assert "removed_placeholder_idxs" in result
+        assert "content_loss_warning" in result
 
 
 # ===== pptx_apply_picture_effects =====

@@ -2518,11 +2518,25 @@ class PptxTools:
                         if ph_idx not in new_ph_idxs:
                             shapes_to_remove.append(shape)
 
+                # 收集被移除的 placeholder 信息（含内容的要特别标注）
+                removed_info = []
+                for shape in shapes_to_remove:
+                    ph_idx = shape.placeholder_format.idx
+                    has_content = False
+                    try:
+                        if shape.has_text_frame and shape.text_frame.text.strip():
+                            has_content = True
+                    except Exception:
+                        pass
+                    removed_info.append({"idx": ph_idx, "has_content": has_content})
+
+                # 移除 shapes
                 sp_tree = slide.shapes._spTree
                 for shape in shapes_to_remove:
                     sp_tree.remove(shape._element)
 
                 removed_count = len(shapes_to_remove)
+                content_loss_warning = any(info["has_content"] for info in removed_info)
 
                 session.dirty = True
 
@@ -2533,10 +2547,12 @@ class PptxTools:
                     "layout_index": layout_index,
                     "layout_name": target_layout.name,
                     "removed_placeholders": removed_count,
+                    "removed_placeholder_idxs": [info["idx"] for info in removed_info],
+                    "content_loss_warning": content_loss_warning,
                     "message": (
                         f"已将幻灯片 {slide_index} 的版式更改为 '{target_layout.name}'"
                         f"，移除了 {removed_count} 个孤立的 placeholder"
-                    ),
+                    ) + ("（⚠️ 部分占位符包含内容，已随版式切换一并移除）" if content_loss_warning else ""),
                 }
 
     def apply_picture_effects(
