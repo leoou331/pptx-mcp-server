@@ -151,15 +151,27 @@ class TestManageSlideMasters:
         tools, sid = tools_env
         with pytest.raises(ValueError, match="不能为负数"):
             tools.manage_slide_masters(
-                session_id=sid, action="list", master_index=-1,
+                session_id=sid, action="apply", master_index=-1,
+                slide_index=0, layout_index=0,
             )
 
     def test_master_index_type_error(self, tools_env):
         tools, sid = tools_env
         with pytest.raises(TypeError, match="master_index 必须是整数"):
             tools.manage_slide_masters(
-                session_id=sid, action="list", master_index="abc",
+                session_id=sid, action="apply", master_index="abc",
+                slide_index=0, layout_index=0,
             )
+
+    def test_list_ignores_master_index(self, tools_env):
+        """list 操作应忽略 master_index 参数，不进行验证。"""
+        tools, sid = tools_env
+        # 传入超大 master_index 也不应报错
+        result = tools.manage_slide_masters(
+            session_id=sid, action="list", master_index=999,
+        )
+        assert result["action"] == "list"
+        assert result["total_masters"] >= 1
 
 
 # ===== pptx_apply_picture_effects =====
@@ -407,3 +419,90 @@ class TestApplyPictureEffects:
         )
         assert "brightness" in result["applied_effects"]
         assert "contrast" in result["applied_effects"]
+
+        # 验证 XML：只有一个 a:lum 元素，同时包含 bright 和 contrast 属性
+        session = tools.sessions.get(sid)
+        prs = session.presentation
+        slide = prs.slides[0]
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+        pictures = [s for s in slide.shapes if s.shape_type == MSO_SHAPE_TYPE.PICTURE]
+        pic = pictures[0]
+        bf = pic._element.find(qn("p:blipFill")); blipFill = bf if bf is not None else pic._element.find(qn("pic:blipFill"))
+        blip = blipFill.find(qn("a:blip"))
+        lum_elements = blip.findall(qn("a:lum"))
+        assert len(lum_elements) == 1, f"期望 1 个 a:lum 元素，实际 {len(lum_elements)} 个"
+        assert lum_elements[0].get("bright") == "20000"
+        assert lum_elements[0].get("contrast") == "30000"
+
+    def test_brightness_only_no_contrast_attr(self, image_env):
+        """只设置 brightness 时，a:lum 不应包含 contrast 属性。"""
+        tools, sid, _ = image_env
+        tools.apply_picture_effects(
+            session_id=sid, slide_index=0, shape_index=0,
+            effects={"brightness": 0.5},
+        )
+        session = tools.sessions.get(sid)
+        prs = session.presentation
+        slide = prs.slides[0]
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+        pictures = [s for s in slide.shapes if s.shape_type == MSO_SHAPE_TYPE.PICTURE]
+        bf = pictures[0]._element.find(qn("p:blipFill")); blipFill = bf if bf is not None else pictures[0]._element.find(qn("pic:blipFill"))
+        blip = blipFill.find(qn("a:blip"))
+        lum_elements = blip.findall(qn("a:lum"))
+        assert len(lum_elements) == 1
+        assert lum_elements[0].get("bright") == "50000"
+        assert lum_elements[0].get("contrast") is None
+
+    def test_contrast_zero_no_lum_element(self, image_env):
+        """contrast == 0 且无 brightness 时，不应创建 a:lum 元素。"""
+        tools, sid, _ = image_env
+        tools.apply_picture_effects(
+            session_id=sid, slide_index=0, shape_index=0,
+            effects={"contrast": 0},
+        )
+        session = tools.sessions.get(sid)
+        prs = session.presentation
+        slide = prs.slides[0]
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+        pictures = [s for s in slide.shapes if s.shape_type == MSO_SHAPE_TYPE.PICTURE]
+        bf = pictures[0]._element.find(qn("p:blipFill")); blipFill = bf if bf is not None else pictures[0]._element.find(qn("pic:blipFill"))
+        blip = blipFill.find(qn("a:blip"))
+        lum_elements = blip.findall(qn("a:lum"))
+        assert len(lum_elements) == 0, "contrast=0 不应创建 a:lum 元素"
+
+    def test_brightness_zero_contrast_nonzero(self, image_env):
+        """brightness == 0, contrast != 0 时，只写 contrast 属性。"""
+        tools, sid, _ = image_env
+        tools.apply_picture_effects(
+            session_id=sid, slide_index=0, shape_index=0,
+            effects={"brightness": 0, "contrast": 0.4},
+        )
+        session = tools.sessions.get(sid)
+        prs = session.presentation
+        slide = prs.slides[0]
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+        pictures = [s for s in slide.shapes if s.shape_type == MSO_SHAPE_TYPE.PICTURE]
+        bf = pictures[0]._element.find(qn("p:blipFill")); blipFill = bf if bf is not None else pictures[0]._element.find(qn("pic:blipFill"))
+        blip = blipFill.find(qn("a:blip"))
+        lum_elements = blip.findall(qn("a:lum"))
+        assert len(lum_elements) == 1
+        assert lum_elements[0].get("bright") is None
+        assert lum_elements[0].get("contrast") == "40000"
+
+    def test_perspective_shadow_rejected(self, image_env):
+        """perspective 阴影类型应被拒绝。"""
+        tools, sid, _ = image_env
+        with pytest.raises(ValueError, match="shadow.type 无效.*perspective"):
+            tools.apply_picture_effects(
+                session_id=sid, slide_index=0, shape_index=0,
+                effects={"shadow": {"type": "perspective"}},
+            )
+
+    def test_shadow_invalid_color_validated(self, image_env):
+        """阴影颜色应经过验证。"""
+        tools, sid, _ = image_env
+        with pytest.raises(ValueError, match="无效的颜色格式"):
+            tools.apply_picture_effects(
+                session_id=sid, slide_index=0, shape_index=0,
+                effects={"shadow": {"color": "ZZZZZZ"}},
+            )

@@ -511,7 +511,7 @@ TOOLS = [
                             "type": "object",
                             "description": "阴影设置",
                             "properties": {
-                                "type": {"type": "string", "enum": ["outer", "inner", "perspective"], "description": "阴影类型"},
+                                "type": {"type": "string", "enum": ["outer", "inner"], "description": "阴影类型"},
                                 "blur_radius": {"type": "number", "description": "模糊半径（磅）"},
                                 "distance": {"type": "number", "description": "阴影距离（磅）"},
                                 "angle": {"type": "number", "description": "角度（度）"},

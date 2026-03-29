@@ -2417,12 +2417,11 @@ class PptxTools:
         if action not in ("list", "apply"):
             raise ValueError(f"无效的 action: {action!r}（支持: list, apply）")
 
-        if not isinstance(master_index, int) or isinstance(master_index, bool):
-            raise TypeError("master_index 必须是整数")
-        if master_index < 0:
-            raise ValueError("master_index 不能为负数")
-
         if action == "apply":
+            if not isinstance(master_index, int) or isinstance(master_index, bool):
+                raise TypeError("master_index 必须是整数")
+            if master_index < 0:
+                raise ValueError("master_index 不能为负数")
             if slide_index is None:
                 raise ValueError("apply 操作需要 slide_index 参数")
             if layout_index is None:
@@ -2437,12 +2436,7 @@ class PptxTools:
         with session.lock:
             prs = session.presentation
 
-            # 验证 master_index
             masters = list(prs.slide_masters)
-            if master_index >= len(masters):
-                raise ValueError(
-                    f"master_index {master_index} 超出范围 (有效范围: 0-{len(masters) - 1})"
-                )
 
             if action == "list":
                 masters_info = []
@@ -2468,6 +2462,12 @@ class PptxTools:
                 }
 
             else:  # apply
+                # 验证 master_index
+                if master_index >= len(masters):
+                    raise ValueError(
+                        f"master_index {master_index} 超出范围 (有效范围: 0-{len(masters) - 1})"
+                    )
+
                 slide_index = self._validate_slide_index(prs, slide_index)
                 slide = prs.slides[slide_index]
                 master = masters[master_index]
@@ -2580,7 +2580,7 @@ class PptxTools:
             shadow = effects["shadow"]
             if not isinstance(shadow, dict):
                 raise TypeError("shadow 必须是字典")
-            valid_shadow_types = ("outer", "inner", "perspective")
+            valid_shadow_types = ("outer", "inner")
             stype = shadow.get("type", "outer")
             if stype not in valid_shadow_types:
                 raise ValueError(
@@ -2684,15 +2684,17 @@ class PptxTools:
                 self._apply_transparency_effect(picture, effects["transparency"])
                 applied.append("transparency")
 
-            # 5. 亮度（通过 XML 操作 blip 的 lum 效果）
-            if "brightness" in effects:
-                self._apply_brightness_effect(picture, effects["brightness"])
-                applied.append("brightness")
-
-            # 6. 对比度（通过 XML 操作 blip 的对比度效果）
-            if "contrast" in effects:
-                self._apply_contrast_effect(picture, effects["contrast"])
-                applied.append("contrast")
+            # 5 & 6. 亮度和对比度（统一管理 a:lum 元素）
+            if "brightness" in effects or "contrast" in effects:
+                self._apply_lum_effect(
+                    picture,
+                    brightness=effects.get("brightness"),
+                    contrast=effects.get("contrast"),
+                )
+                if "brightness" in effects:
+                    applied.append("brightness")
+                if "contrast" in effects:
+                    applied.append("contrast")
 
             session.dirty = True
 
@@ -2737,10 +2739,8 @@ class PptxTools:
 
         if stype == "outer":
             shadow_elem = etree.SubElement(effectLst, qn("a:outerShdw"))
-        elif stype == "inner":
+        else:  # inner
             shadow_elem = etree.SubElement(effectLst, qn("a:innerShdw"))
-        else:  # perspective
-            shadow_elem = etree.SubElement(effectLst, qn("a:outerShdw"))
 
         shadow_elem.set("blurRad", str(blur_emu))
         shadow_elem.set("dist", str(dist_emu))
@@ -2748,10 +2748,10 @@ class PptxTools:
         if stype != "inner":
             shadow_elem.set("rotWithShape", "0")
 
-        # 颜色
+        # 颜色（使用 _parse_hex_color 进行验证）
         srgbClr = etree.SubElement(shadow_elem, qn("a:srgbClr"))
-        cleaned = color_hex.strip().lstrip("#")
-        srgbClr.set("val", cleaned)
+        parsed_color = self._parse_hex_color(color_hex)
+        srgbClr.set("val", str(parsed_color).upper())
 
     def _apply_transparency_effect(self, picture, transparency: float) -> None:
         """通过修改 blip 的 alphaModFix 设置图片透明度。"""
@@ -2778,8 +2778,14 @@ class PptxTools:
             alpha_mod = etree.SubElement(blip, qn("a:alphaModFix"))
             alpha_mod.set("amt", str(amt))
 
-    def _apply_brightness_effect(self, picture, brightness: float) -> None:
-        """通过修改 blip 的 lum 效果设置亮度。"""
+    def _apply_lum_effect(self, picture, brightness=None, contrast=None) -> None:
+        """统一管理 a:lum 元素（亮度和对比度共用同一元素）。
+
+        Args:
+            picture: 图片形状对象
+            brightness: 亮度值 (-1.0 ~ 1.0)，None 表示不设置
+            contrast: 对比度值 (-1.0 ~ 1.0)，None 表示不设置
+        """
         from lxml import etree
 
         blipFill = picture._element.find(qn("p:blipFill"))
@@ -2792,35 +2798,24 @@ class PptxTools:
         if blip is None:
             return
 
-        # 移除旧的 lum 效果
+        # 移除已有的 a:lum
         for old in blip.findall(qn("a:lum")):
             blip.remove(old)
 
-        if brightness != 0:
-            # bright: 百分比值 * 100000（如 0.5 → 50000）
-            bright_val = int(brightness * 100000)
-            lum = etree.SubElement(blip, qn("a:lum"))
-            lum.set("bright", str(bright_val))
-
-    def _apply_contrast_effect(self, picture, contrast: float) -> None:
-        """通过修改 blip 的 lum 效果设置对比度。"""
-        from lxml import etree
-
-        blipFill = picture._element.find(qn("p:blipFill"))
-        if blipFill is None:
-            blipFill = picture._element.find(qn("pic:blipFill"))
-        if blipFill is None:
+        # 如果亮度和对比度都没有设置，直接返回
+        if brightness is None and contrast is None:
             return
 
-        blip = blipFill.find(qn("a:blip"))
-        if blip is None:
+        # 忽略为 0 的值（避免留下无意义属性）
+        has_brightness = brightness is not None and brightness != 0
+        has_contrast = contrast is not None and contrast != 0
+
+        if not has_brightness and not has_contrast:
             return
 
-        # 查找现有的 lum 元素（可能已在 brightness 中创建）
-        lum = blip.find(qn("a:lum"))
-        if lum is None:
-            lum = etree.SubElement(blip, qn("a:lum"))
-
-        # contrast: 百分比值 * 100000（如 0.5 → 50000）
-        contrast_val = int(contrast * 100000)
-        lum.set("contrast", str(contrast_val))
+        lum = etree.SubElement(blip, qn("a:lum"))
+        if has_brightness:
+            lum.set("bright", str(int(brightness * 100000)))
+        if has_contrast:
+            lum.set("contrast", str(int(contrast * 100000)))
+        blip.append(lum)
