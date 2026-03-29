@@ -2506,6 +2506,24 @@ class PptxTools:
                     RT.SLIDE_LAYOUT, target_layout.part
                 )
 
+                # 同步 placeholder shapes：移除在新版式中不存在的孤立 placeholder
+                new_ph_idxs = {
+                    ph.placeholder_format.idx
+                    for ph in target_layout.placeholders
+                }
+                shapes_to_remove = []
+                for shape in slide.shapes:
+                    if shape.is_placeholder:
+                        ph_idx = shape.placeholder_format.idx
+                        if ph_idx not in new_ph_idxs:
+                            shapes_to_remove.append(shape)
+
+                sp_tree = slide.shapes._spTree
+                for shape in shapes_to_remove:
+                    sp_tree.remove(shape._element)
+
+                removed_count = len(shapes_to_remove)
+
                 session.dirty = True
 
                 return {
@@ -2514,7 +2532,11 @@ class PptxTools:
                     "master_index": master_index,
                     "layout_index": layout_index,
                     "layout_name": target_layout.name,
-                    "message": f"已将幻灯片 {slide_index} 的版式更改为 '{target_layout.name}'",
+                    "removed_placeholders": removed_count,
+                    "message": (
+                        f"已将幻灯片 {slide_index} 的版式更改为 '{target_layout.name}'"
+                        f"，移除了 {removed_count} 个孤立的 placeholder"
+                    ),
                 }
 
     def apply_picture_effects(

@@ -173,6 +173,96 @@ class TestManageSlideMasters:
         assert result["action"] == "list"
         assert result["total_masters"] >= 1
 
+    def test_apply_removes_orphan_placeholders(self, tools_env):
+        """切换到 Blank layout 后，孤立的 title/subtitle placeholder 应被移除。"""
+        tools, sid = tools_env
+
+        # 默认 layout_index=0 是 Title Slide，包含 title(idx=0) 和 subtitle(idx=1)
+        # 先确认当前幻灯片有 placeholder
+        session = tools.sessions.get(sid)
+        slide = session.presentation.slides[0]
+        initial_phs = [s for s in slide.shapes if s.is_placeholder]
+        initial_ph_idxs = {
+            s.placeholder_format.idx for s in slide.shapes if s.is_placeholder
+        }
+        assert 0 in initial_ph_idxs, "初始幻灯片应有 title placeholder (idx=0)"
+
+        # 找到 Blank layout (index 6)，它没有 idx 0 和 1
+        # 先确认 Blank layout 不包含 title placeholder
+        master = session.presentation.slide_masters[0]
+        blank_layout_idx = 6  # "Blank" layout in default theme
+        blank_layout = list(master.slide_layouts)[blank_layout_idx]
+        blank_ph_idxs = {
+            ph.placeholder_format.idx for ph in blank_layout.placeholders
+        }
+        assert 0 not in blank_ph_idxs, "Blank layout should not have title placeholder"
+
+        # 应用 Blank layout
+        result = tools.manage_slide_masters(
+            session_id=sid,
+            action="apply",
+            slide_index=0,
+            master_index=0,
+            layout_index=blank_layout_idx,
+        )
+        assert result["action"] == "apply"
+        assert result["removed_placeholders"] > 0
+
+        # 验证幻灯片上不再有 title/subtitle placeholder
+        slide = session.presentation.slides[0]
+        remaining_ph_idxs = {
+            s.placeholder_format.idx for s in slide.shapes if s.is_placeholder
+        }
+        # idx 0 (title) 和 idx 1 (subtitle) 应被移除
+        assert 0 not in remaining_ph_idxs, "Title placeholder (idx=0) should be removed"
+        assert 1 not in remaining_ph_idxs, "Subtitle placeholder (idx=1) should be removed"
+        # 共有的 placeholder (10, 11, 12) 应被保留
+        for idx in blank_ph_idxs:
+            if idx in initial_ph_idxs:
+                assert idx in remaining_ph_idxs, (
+                    f"Placeholder idx={idx} exists in both layouts and should be kept"
+                )
+
+    def test_apply_keeps_matching_placeholders(self, tools_env):
+        """切换版式时，新版式中也有的 placeholder idx 应保留。"""
+        tools, sid = tools_env
+
+        session = tools.sessions.get(sid)
+        master = session.presentation.slide_masters[0]
+
+        # 找两个都有 placeholder 的版式（title slide -> title + content）
+        layouts = list(master.slide_layouts)
+        if len(layouts) < 2:
+            pytest.skip("Need at least 2 layouts")
+
+        # Layout 0 = Title Slide, Layout 1 = Title and Content（通常都有 title idx=0）
+        # 先切到 layout 1
+        result = tools.manage_slide_masters(
+            session_id=sid,
+            action="apply",
+            slide_index=0,
+            master_index=0,
+            layout_index=1,
+        )
+        assert result["action"] == "apply"
+
+        # 检查结果：layout 1 通常有 title (idx=0)，
+        # 那么 title placeholder 应该被保留
+        slide = session.presentation.slides[0]
+        layout_1 = layouts[1]
+        layout_1_ph_idxs = {
+            ph.placeholder_format.idx for ph in layout_1.placeholders
+        }
+        remaining_ph_idxs = {
+            s.placeholder_format.idx
+            for s in slide.shapes if s.is_placeholder
+        }
+        # 所有保留的 placeholder 应该在新版式中存在
+        assert remaining_ph_idxs.issubset(layout_1_ph_idxs), (
+            f"Remaining placeholders {remaining_ph_idxs} should be subset "
+            f"of new layout placeholders {layout_1_ph_idxs}"
+        )
+
 
 # ===== pptx_apply_picture_effects =====
 
